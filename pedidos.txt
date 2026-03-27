@@ -1,0 +1,132 @@
+
+------------------------
+Cliente: 73736132759715@lid
+Pedido: pastor
+Precio: $130
+Dirección: Lola
+Fecha: 23/3/2026, 2:21:57 p.m.
+
+------------------------
+Cliente: 73736132759715@lid
+Pedido: peperoni
+Precio: $99
+Dirección: No
+Fecha: 24/3/2026, 1:30:34 p.m.
+
+------------------------
+Cliente: 73736132759715@lid
+Pedido: peperoni
+Precio: $99
+Dirección: Raul Sandoval
+Fecha: 24/3/2026, 3:53:39 p.m.
+
+------------------------
+Cliente: 227899638599812@lid
+Pedido: hawaiana
+Complementos: 
+Extras: 
+Precio total: $200
+Dirección: Palma
+Fecha: 25/3/2026, 1:07:06 p.m.
+
+------------------------
+Cliente: 8207984545920@lid
+Pizza: hawaiana
+Tamaño: grande
+Complementos: 
+Extras: 
+Total: $200
+Dirección: felipe carrillo puerto #190
+Fecha: 25/3/2026, 1:07:11 p.m.
+
+------------------------
+Cliente: 8207984545920@lid
+Pizza: peperoni / pastor
+Tamaño: jumbo
+Complementos: 
+Extras: 
+Total: $0
+Dirección: felipe carrillo puerto #190
+Fecha: 25/3/2026, 1:08:22 p.m.
+
+------------------------
+Cliente: 8207984545920@lid
+Pedido: 
+Complementos: alitas x1
+Extras: 
+Precio total: $125
+Dirección: 
+Fecha: 25/3/2026, 1:09:11 p.m.
+
+------------------------
+Cliente: 63827576148078@lid
+Pedido: hawaiana
+Complementos: 
+Extras: 
+Precio total: $200
+Dirección: Ok
+Fecha: 25/3/2026, 1:12:37 p.m.
+
+------------------------
+Cliente: 73736132759715@lid
+Pedido: hawaiana
+Complementos: alitas x1
+Extras: 
+Precio total: $325
+Dirección: 
+Fecha: 25/3/2026, 1:12:45 p.m.
+
+------------------------
+Cliente: 227770856661141@lid
+Referencia: 
+Pedido: hawaiana
+Complementos: 
+Extras: 
+Precio total: $200
+Refresco promo: sí — ver mensaje
+Dirección: Felipe carrillo
+Fecha: 26/3/2026, 9:16:12 a.m.
+
+------------------------
+Cliente: 227770856661141@lid
+Referencia: 
+Pedido: 
+Complementos: papas a la francesa x1
+Extras: 
+Precio total: $65
+Refresco promo: 
+Dirección: Y la pizza
+Fecha: 26/3/2026, 9:19:48 a.m.
+
+------------------------
+Cliente: 227770856661141@lid
+Referencia: 
+Pedido: 
+Complementos: papas a la francesa x1
+Extras: 
+Precio total: $65
+Refresco promo: 
+Dirección: Y la pizza la agregas
+Fecha: 26/3/2026, 10:04:30 a.m.
+
+------------------------
+Cliente: 227770856661141@lid
+Referencia: 
+Pedido: 
+Complementos: papas a la francesa x1
+Extras: 
+Precio total: $65
+Refresco promo: 
+Dirección: Y la pizza
+Fecha: 26/3/2026, 10:54:18 a.m.
+
+------------------------
+Cliente: 227770856661141@lid
+Referencia: 
+Pedido: mexicana
+Complementos: papas a la francesa x1
+Extras: 
+Precio total: $65
+Refresco promo: 
+Dirección: Finalizar
+Fecha: 26/3/2026, 11:17:35 a.m.

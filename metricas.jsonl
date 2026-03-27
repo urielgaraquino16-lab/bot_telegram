@@ -1,0 +1,22 @@
+{"ts":"2026-03-26T17:16:02.517Z","evento":"nuevo_cliente","from":"227770856661141@lid","quien":"LID 227770856661141@lid"}
+{"ts":"2026-03-26T17:17:08.070Z","evento":"consulta_recomendacion","from":"227770856661141@lid"}
+{"ts":"2026-03-26T17:17:35.334Z","evento":"pedido_confirmado","from":"227770856661141@lid","tipo":"direccion_texto","total":65,"conPizza":true,"lineasComplemento":0,"lineasBebida":0}
+{"ts":"2026-03-26T17:17:40.717Z","evento":"nuevo_cliente","from":"227770856661141@lid","quien":"LID 227770856661141@lid"}
+{"ts":"2026-03-26T17:17:41.347Z","evento":"pedido_cancelado","from":"227770856661141@lid","paso":"inicio"}
+{"ts":"2026-03-26T17:19:15.919Z","evento":"pedido_cancelado","from":"227770856661141@lid","paso":"solo_complementos"}
+{"ts":"2026-03-26T17:20:23.826Z","evento":"consulta_promos","from":"227770856661141@lid"}
+{"ts":"2026-03-26T18:01:48.171Z","evento":"nuevo_cliente","from":"227770856661141@lid","quien":"LID 227770856661141@lid"}
+{"ts":"2026-03-26T18:02:10.878Z","evento":"pedido_derivado_humano","from":"227770856661141@lid","paso":"confirmar","conPizza":true,"lineasComplemento":0,"lineasBebida":0}
+{"ts":"2026-03-26T18:02:33.522Z","evento":"nuevo_cliente","from":"227770856661141@lid","quien":"LID 227770856661141@lid"}
+{"ts":"2026-03-26T18:03:25.964Z","evento":"pedido_derivado_humano","from":"227770856661141@lid","paso":"confirmar","conPizza":false,"lineasComplemento":1,"lineasBebida":0}
+{"ts":"2026-03-26T19:48:30.946Z","evento":"nuevo_cliente","from":"120363420248824045@g.us","quien":"Grupo (120363420248824045@g.us) de +41442676346988@lid"}
+{"ts":"2026-03-26T19:49:11.261Z","evento":"nuevo_cliente","from":"73736132759715@lid","quien":"LID 73736132759715@lid"}
+{"ts":"2026-03-26T19:50:25.934Z","evento":"consulta_promos","from":"73736132759715@lid"}
+{"ts":"2026-03-26T19:51:06.508Z","evento":"consulta_promos","from":"73736132759715@lid"}
+{"ts":"2026-03-26T19:51:22.044Z","evento":"consulta_promos","from":"73736132759715@lid"}
+{"ts":"2026-03-26T19:55:17.760Z","evento":"nuevo_cliente","from":"73736132759715@lid","quien":"LID 73736132759715@lid"}
+{"ts":"2026-03-26T19:55:18.436Z","evento":"consulta_promos","from":"73736132759715@lid"}
+{"ts":"2026-03-26T20:53:01.918Z","evento":"pedido_derivado_humano","from":"260039432491083@lid","paso":"confirmar","conPizza":false,"lineasComplemento":1,"lineasBebida":0}
+{"ts":"2026-03-26T20:53:15.964Z","evento":"nuevo_cliente","from":"260039432491083@lid","quien":"LID 260039432491083@lid"}
+{"ts":"2026-03-26T20:54:36.168Z","evento":"pedido_derivado_humano","from":"260039432491083@lid","paso":"confirmar","conPizza":true,"lineasComplemento":0,"lineasBebida":0}
+{"ts":"2026-03-26T20:54:41.899Z","evento":"nuevo_cliente","from":"260039432491083@lid","quien":"LID 260039432491083@lid"}

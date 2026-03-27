@@ -1,0 +1,161 @@
+{
+  "nombreNegocio": "Pizzas Carly",
+  "horarioTexto": "Lunes a domingo 12:00 PM a 10:30 PM",
+  "horarioAbierto": { "inicio": "08:00", "fin": "22:30" },
+  "servicioDomicilio": true,
+  "servicioDomicilioTexto": "🚚 Sí, tenemos servicio a domicilio dentro de la zona (el repartidor confirma tu dirección).",
+  "promocionesTexto": "🔥 Tenemos promociones según el día (pide saludo y entra a *Promociones*).",
+  "combosTexto": "🍕 Sí contamos con combos; el detalle varía. Puedes escribir saludo y revisar el menú, o preguntar a un asesor por el combo que buscas.",
+  "combosImagenGeneralUrl": "https://drive.google.com/file/d/1_yX7ZKPLRn0hIJGKI0Kvtvg2AshMMSz_/view?usp=drive_link",
+  "mitadMitad": {
+    "permitido": true,
+    "notaPrecio": "Puedes pedir mitad y mitad de pizza"
+  },
+  "ingredientAliases": {
+    "peperoni": "pepperoni, peperonni, peperony, pepperonni",
+    "hawaiana": "hawai, hawaianna, jamón con piña, jamon con piña, piña",
+    "mexicana": "mexico, mexicano",
+    "pastor": "trompo, al pastor, alpastor"
+  },
+  "faqs": [
+    {
+      "triggers": "formas de pago, como pago,no aceptan tarjeta, efectivo, transferencia",
+      "respuesta": "💳 Aceptamos efectivo y transferencia; tarjeta según disponibilidad en tienda. Si necesitas factura o cargo con terminal, te conecto con un asesor."
+    },
+    {
+      "triggers": "tiempo de entrega, cuanto tardan, demora",
+      "respuesta": "⏱ Normalmente 30–40 min según zona y carga del día; se te confirma al salir."
+    }
+  ],
+  "extras": [
+    {
+      "nombre": "extra queso",
+      "precio": 65,
+      "precioPorTamano": { "mega": 130 },
+      "aliases": "más queso, mas queso, doble queso, extra de queso"
+    },
+    { "nombre": "orilla de queso", "precio": 0, "aliases": "borde relleno, orilla rellena, stuffed crust" },
+    { "nombre": "sin orilla rellena", "precio": 0, "aliases": "sin borde relleno, sin bordo relleno, sin orilla" },
+    { "nombre": "masa delgada", "precio": 0, "aliases": "delgada, masa fina, thin" },
+    { "nombre": "dorada", "precio": 0, "aliases": "crujiente, bien cocida, extra horneada" }
+  ],
+  "escalamientoHumano": {
+    "triggers": "reembolso, devolución, queja, inconforme, alergia, intoxicación, factura fiscal, ticket, problemas con el pedido"
+  },
+  "alitasBonelessComplejo": {
+    "triggers": "tres salsas, cuatro salsas, otra salsa que no este, combinacion rara de salsas, empanizado especial"
+  },
+  "alitasBonelessSalsas": {
+    "aplicaA": "alitas, boneless, wings, nuggets",
+    "precioExtraMitadMitad": 10,
+    "imagenUrl": "https://drive.google.com/file/d/1LmUJScrlShIi3TbZpaq9X55eYRBoLtF_/view?usp=drive_link",
+    "lista": [
+      { "id": "bbq", "nombre": "BBQ", "aliases": "barbecue, barbacoa" },
+      { "id": "piña_habanero", "nombre": "Piña hanbanero", "aliases": "piña habanero, piña" },
+      { "id": "ajo", "nombre": "Ajo Parmesano", "aliases": "ajo parmesano, ajo" },
+      { "id": "chipotle", "nombre": "Chipotle", "aliases": "chipotle, salsa chipotle" },
+      { "id": "bbq_hanabero", "nombre": "BBQ Habanero", "aliases": "barbecue habanero,bbq picosa" },
+      { "id": "buffalo", "nombre": "Buffalo", "aliases": "bufalo, búfalo" },
+      { "id": "mango", "nombre": "Mango habanero", "aliases": "mango habanero, habanero" },
+      { "id": "natural", "nombre": "Natural (sin salsa)", "aliases": "sin salsa, naturales, natural" }
+    ]
+  },
+  "upsell": {
+    "alConfirmarPizza": {
+      "activo": true,
+      "texto": "\n\n🍟 ¿Llevas *complementos* o 🥤 *bebidas*? Menú opción *4* o escribe lo que quieras agregar."
+    }
+  },
+  "recordatorioRefrescoGratis": {
+    "activo": true,
+    "tamanosConRefresco": ["grande", "familiar", "jumbo", "mega"],
+    "mensajeCliente": "🥤 *Recuerda:* tu pizza *grande o mayor lleva refresco GRATIS* hoy. *Conserva este chat*: si al reparto no te lo dan, *muéstrales este mensaje*.",
+    "mensajeSiNoHayTamano": "🥤 Si tu pedido incluye pizza *grande o mayor*, suele aplicar *refresco gratis*. *Guarda este chat* por si hace falta recordarlo en entrega."
+  },
+  "promociones": [
+    {
+      "id": "jueves_a_martes",
+      "titulo": "🛵 Pasa y recoge tu pedido",
+      "diasSemana": [4, 5, 6, 0, 1, 2],
+      "textoCliente": "🍕 pide tu pizza ya sea *grande por 175 pesos* o *familiar por 225 pesos*.",
+      "imagenUrl": "https://drive.google.com/file/d/1hBIgAHZW44Xr2oJW3ne8JleMSo--xByB/view?usp=drive_link",
+      "vigencia": {},
+      "incluyeRefresco": null,
+      "tamanosAplica": ["grande, familiar"],
+      "saboresPermitidos": ["hawaiana,peproni,jamon,salchicha, champiñones,tocino,queso,chorizo"],
+      "saboresExcluidos": []
+    },
+    {
+      "id": "lunes_y_viernes",
+      "titulo": "🔥 Promo lunes y viernes",
+      "diasSemana": [1, 5],
+      "textoCliente": "🍕 Pizza jumbo en *$290* pesos.",
+      "imagenUrl": "https://drive.google.com/file/d/17Cc0JUh51DBEXU5BdSRiwmdavK_DrhPU/view?usp=drive_link",
+      "vigencia": {},
+      "incluyeRefresco": false,
+      "tamanosAplica": ["jumbo"],
+      "saboresPermitidos": ["hawaiana,peproni,jamon,salchicha, champiñones,tocino,queso,chorizo"],
+      "saboresExcluidos": []
+    },
+    {
+      "id": "sabado_domingo", 
+      "titulo": "🍟 Combo 1",
+      "diasSemana": [0, 6],
+      "textoCliente": "🍕 Pizza grande + 🍟 papas a la francesa + 🥤 refresco 1.5L. Precio: *$275*",
+      "imagenUrl": "https://drive.google.com/file/d/1HouMPp5C5qQxture4uvWQHUyR990DUes/view?usp=drive_link",
+      "vigencia": {},
+      "incluyeRefresco": true,
+      "tamanosAplica": ["grande"],
+      "saboresPermitidos": ["hawaiana", "peperoni", "jamon", "salchicha", "champiñones", "tocino", "queso", "chorizo"],
+      "saboresExcluidos": []
+    },
+    {
+      "id": "sabado_combo_2",
+      "titulo": "🍟 Combo 2",
+      "diasSemana": [0,6],
+      "textoCliente": "🍕 Pizza grande + 🍟 papas sazonadas + 🥤 refresco 1.5L. Precio: *$285*",
+      "imagenUrl": "https://drive.google.com/file/d/1dz9oGJ0ElJJbG6JvG92GAx58tzUELa11/view?usp=drive_link",
+      "vigencia": {},
+      "incluyeRefresco": true,
+      "tamanosAplica": ["grande"],
+      "saboresPermitidos": ["hawaiana,peproni,jamon,salchicha, champiñones,tocino,queso,chorizo"],
+      "saboresExcluidos": []
+    },
+    {
+      "id": "domingo_combo_1",
+      "titulo": "🍗 Combo 3",
+      "diasSemana": [0, 6, 4],
+      "textoCliente": "🍕 Pizza grande + 🍗 nuggets + 🥤 refresco 1.5L. Precio: *$305*",
+      "imagenUrl": "https://drive.google.com/file/d/1xPpPhPiIX9rTDI2r4Vg6SfYmXZHnZjJ8/view?usp=drive_link",
+      "vigencia": {},
+      "incluyeRefresco": true,
+      "tamanosAplica": ["jumbo"],
+      "saboresPermitidos": ["hawaiana,peproni,jamon,salchicha, champiñones,tocino,queso,chorizo"],
+      "saboresExcluidos": []
+    },
+    {
+      "id": "domingo_combo_2",
+      "titulo": "🍗 Combo 4",
+      "diasSemana": [0,6],
+      "textoCliente": "🍕 Pizza grande + 🍗 alitas o boneless + 🥤 refresco 1.5L. Precio: *$325*",
+      "imagenUrl": "https://drive.google.com/file/d/1bf-Z8r5pwGPWA1wuGUBAoULDW5p3G41T/view?usp=drive_link",
+      "vigencia": {},
+      "incluyeRefresco": true,
+      "tamanosAplica": ["grande"],
+      "saboresPermitidos": ["hawaiana,peproni,jamon,salchicha, champiñones,tocino,queso,chorizo"],
+      "saboresExcluidos": []
+    },
+    {
+      "id": "miercoles_refresco",
+      "titulo": "🥤 Miércoles",
+      "diasSemana": [3],
+      "textoCliente": "🥤 Promo de miércoles; indica si incluye refresco en `incluyeRefresco`.",
+      "imagenUrl": "https://drive.google.com/file/d/1IeTj0XA-gaUnVveDnuVXxdqlXczkN0d2/view?usp=drive_link",
+      "vigencia": {},
+      "incluyeRefresco": true,
+      "tamanosAplica": [],
+      "saboresPermitidos": null,
+      "saboresExcluidos": []
+    }
+  ]
+}
