@@ -1,6 +1,6 @@
 console.log("🔥 Bot iniciando...");
 
-const { default: makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
+const { default: makeWASocket } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
 
 const express = require("express");
@@ -54,30 +54,45 @@ process.on("uncaughtException", (err) => {
 
 
 // 💲 PRECIOS
-function cargarMenu() {
-  const workbook = XLSX.readFile("menu.xlsx");
-  const sheet = workbook.Sheets["menu"];
+const MENU_SHEET_URL = "https://docs.google.com/spreadsheets/d/1NVibDl4n3VYDa5ZJbR9Rr1yX6vSrzJxAwRE0DrxMD38/edit?usp=sharing";
 
-  const data = XLSX.utils.sheet_to_json(sheet);
+async function obtenerDatosMenuGoogleSheets() {
+  const sheetIdMatch = MENU_SHEET_URL.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  const sheetId = sheetIdMatch?.[1] || "";
+  if (!sheetId) return [];
 
-  const menu = {};
-
-  data.forEach(row => {
-    const pizza = row.pizza.toLowerCase().trim();
-    const tamaño = row.tamaño.toLowerCase().trim();
-    const precio = Number(row.precio);
-
-    if (!menu[pizza]) {
-      menu[pizza] = {};
-    }
-
-    menu[pizza][tamaño] = precio;
-  });
-
-  return menu;
+  const csvUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&sheet=menu`;
+  const response = await axios.get(csvUrl, { responseType: "text" });
+  const workbook = XLSX.read(response.data, { type: "string" });
+  const sheet = workbook.Sheets["menu"] || workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet) return [];
+  return XLSX.utils.sheet_to_json(sheet);
 }
 
-let menu = cargarMenu();
+async function cargarMenu() {
+  try {
+    const data = await obtenerDatosMenuGoogleSheets();
+    const menu = {};
+
+    data.forEach((row) => {
+      const pizza = row.pizza.toLowerCase().trim();
+      const tamaño = row.tamaño.toLowerCase().trim();
+      const precio = Number(row.precio);
+
+      if (!menu[pizza]) {
+        menu[pizza] = {};
+      }
+
+      menu[pizza][tamaño] = precio;
+    });
+
+    return menu;
+  } catch {
+    return {};
+  }
+}
+
+let menu = {};
 
 // 🔄 Auto-recarga de Excel cuando cambie
 let complementosItems = [];
@@ -260,7 +275,7 @@ async function recargarExcelSiCambioAsync() {
     const mtimeMs = st.mtimeMs || 0;
     if (mtimeMs && mtimeMs !== menuExcelMtimeMs) {
       menuExcelMtimeMs = mtimeMs;
-      menu = cargarMenu();
+      menu = await cargarMenu();
       const comp = cargarComplementos();
       complementosItems = comp.items;
       complementosMenu = comp.menu;
@@ -1194,6 +1209,7 @@ async function retryAsync(fn, { attempts = 3, baseDelayMs = 500 } = {}) {
 
 async function sendWhatsAppAdminUrgente(sock, titulo, detalle = "") {
   if (!NUMERO_ADMIN) return;
+
   const t1 = `🚨 ${String(titulo || "ALERTA").trim()}`;
   const t2 = String(detalle || "").trim();
   await retryAsync(
@@ -2292,9 +2308,12 @@ async function aplicarPostEleccionSalsa(sock, from, estado, quien) {
 }
 
 async function startBot() {
+  const { useFirestoreAuthState } = require("./baileys-firestore-auth-state");
+  menu = await cargarMenu();
+  rebuildDetectCache();
   inicializarExcelCache();
   inicializarRestauranteCache();
-  const { state, saveCreds } = await useMultiFileAuthState("auth");
+  const { state, saveCreds } = await useFirestoreAuthState();
 
   const sock = makeWASocket({
     auth: state,
