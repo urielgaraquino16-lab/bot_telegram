@@ -1,7 +1,7 @@
 {
   "nombreNegocio": "Pizzas Carly",
   "horarioTexto": "Lunes a domingo 12:00 PM a 10:30 PM",
-  "horarioAbierto": { "inicio": "08:00", "fin": "22:30" },
+  "horarioAbierto": null,
   "servicioDomicilio": true,
   "servicioDomicilioTexto": "🚚 Sí, tenemos servicio a domicilio dentro de la zona (el repartidor confirma tu dirección).",
   "promocionesTexto": "🔥 Tenemos promociones según el día (pide saludo y entra a *Promociones*).",
