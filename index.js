@@ -1,4 +1,6 @@
 console.log("🔥 Bot iniciando...");
+let ultimoQR = null;
+
 
 const { default: makeWASocket } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
@@ -2326,7 +2328,8 @@ async function startBot() {
   const { connection, lastDisconnect, qr } = update;
 
   if (qr) {
-    console.log("📱 Escanea este QR:");
+    ultimoQR = qr;
+    console.log(" Escanea este QR:");
     qrcode.generate(qr, { small: true });
   }
 
@@ -3683,6 +3686,13 @@ if (estado.intentos >= 2) {
 
 const app = express();
 app.get("/", (_req, res) => res.status(200).send("Bot activo"));
+
+app.get("/qr", async (_req, res) => {
+  if (!ultimoQR) return res.send("<h2>QR no listo, recarga en 5 segundos...</h2><script>setTimeout(()=>location.reload(),5000)</script>");
+  const QRCode = require("qrcode");
+  const img = await QRCode.toDataURL(ultimoQR);
+  res.send(`<img src="${img}" style="width:300px"/>`);
+});
 
 app.listen(PORT, () => {
   console.log(`🌐 Servidor activo en puerto ${PORT}`);
