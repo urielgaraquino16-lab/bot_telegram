@@ -1,4 +1,6 @@
 console.log("🔥 Bot iniciando...");
+
+const QRCode = require("qrcode");
 let ultimoQR = null;
 
 
@@ -3688,10 +3690,13 @@ const app = express();
 app.get("/", (_req, res) => res.status(200).send("Bot activo"));
 
 app.get("/qr", async (_req, res) => {
-  if (!ultimoQR) return res.send("<h2>QR no listo, recarga en 5 segundos...</h2><script>setTimeout(()=>location.reload(),5000)</script>");
-  const QRCode = require("qrcode");
-  const img = await QRCode.toDataURL(ultimoQR);
-  res.send(`<img src="${img}" style="width:300px"/>`);
+  try {
+    if (!ultimoQR) return res.send("<h2>QR no listo, recarga en 5 segundos...</h2><script>setTimeout(()=>location.reload(),5000)</script>");
+    const img = await QRCode.toDataURL(ultimoQR);
+    res.send(`<img src="${img}" style="width:300px"/>`);
+  } catch (err) {
+    res.status(500).send("Error: " + err.message);
+  }
 });
 
 app.listen(PORT, () => {
