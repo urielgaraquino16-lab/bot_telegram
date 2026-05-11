@@ -4,7 +4,10 @@ const QRCode = require("qrcode");
 let ultimoQR = null;
 
 
-const { default: makeWASocket } = require("@whiskeysockets/baileys");
+const {
+  default: makeWASocket,
+  DisconnectReason
+} = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
 
 const express = require("express");
@@ -56,7 +59,7 @@ try {
 }
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL_NAME = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+const GEMINI_MODEL_NAME = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 const GEMINI_SYSTEM_PROMPT =
   "Eres un asistente amable de Pizzas Carly. Solo respondes preguntas sobre el menú, ingredientes, precios, promociones y políticas del negocio. Si no puedes responder con certeza, responde exactamente con la palabra: ESCALAR\nSé breve, máximo 3 líneas. No inventes precios.";
 
@@ -2393,22 +2396,46 @@ async function startBot() {
   }
 
   if (connection === "close") {
-    const shouldReconnect =
-      lastDisconnect?.error?.output?.statusCode !== 401;
+    const statusCode = lastDisconnect?.error?.output?.statusCode;
+    const errMsg = String(
+      lastDisconnect?.error?.message ||
+      lastDisconnect?.error?.output?.payload?.message ||
+      ""
+    ).toLowerCase();
 
-    console.log("❌ Conexión cerrada");
+    const esConflictOReplaced =
+      statusCode === DisconnectReason?.connectionReplaced ||
+      statusCode === DisconnectReason?.connectionLost ||
+      /conflict|replaced/.test(errMsg);
 
-    if (shouldReconnect) {
-      if (!reconnectScheduled) {
-        reconnectScheduled = true;
-        console.log("🔄 Reintentando conexión...");
-        setTimeout(() => {
-          reconnectScheduled = false;
-          startBot(); // reconexión controlada
-        }, 1500);
-      }
-    } else {
-      console.log("🚫 Sesión cerrada, necesitas escanear QR otra vez");
+    const esLoggedOut =
+      statusCode === DisconnectReason?.loggedOut || statusCode === 401;
+
+    console.log(
+      `❌ Conexión cerrada (statusCode=${statusCode || "?"}, msg="${errMsg}")`
+    );
+
+    if (esLoggedOut) {
+      // Sesión revocada: no reconectar automáticamente.
+      // Las credenciales en Firestore se conservan; sólo se requiere re-escaneo de QR.
+      console.log("🚫 Sesión cerrada (logout), necesitas escanear QR otra vez");
+      return;
+    }
+
+    if (!reconnectScheduled) {
+      reconnectScheduled = true;
+      // Otra sesión abrió WhatsApp con este número: esperamos 5s y reintentamos
+      // sin tocar las credenciales en Firestore.
+      const delayMs = esConflictOReplaced ? 5000 : 1500;
+      console.log(
+        esConflictOReplaced
+          ? `🔄 Conflict/replaced detectado, reintentando en ${delayMs}ms (creds intactas)...`
+          : `🔄 Reintentando conexión en ${delayMs}ms...`
+      );
+      setTimeout(() => {
+        reconnectScheduled = false;
+        startBot();
+      }, delayMs);
     }
   }
 });
