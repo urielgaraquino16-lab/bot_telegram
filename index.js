@@ -3710,7 +3710,18 @@ if (await responderIntentDialogflow(sock, from, estado, textoClean)) {
 
 if (estado.intentos >= 2) {
   // Antes de derivar a un asesor humano, intentamos resolver con Gemini.
-  const respuestaGemini = await responderConGemini(textoClean);
+  const contexto = `
+MENÚ DE PIZZAS CARLY:
+${JSON.stringify(menu)}
+
+COMPLEMENTOS:
+${complementosItems.map(c => `${c.nombre}: $${c.precio}`).join('\n')}
+
+DESCRIPCIONES:
+${Object.entries(descripcionesMap).map(([k,v]) => `${k}: ${v.ingredientesTexto}`).join('\n')}
+`;
+
+  const respuestaGemini = await responderConGemini(textoClean, contexto);
   const debeEscalar =
     !respuestaGemini || /^ESCALAR\b/i.test(respuestaGemini.trim());
 
