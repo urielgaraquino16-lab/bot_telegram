@@ -58,19 +58,30 @@ process.on("uncaughtException", (err) => {
 
 
 // 💲 PRECIOS
-const MENU_SHEET_URL = "https://docs.google.com/spreadsheets/d/1NVibDl4n3VYDa5ZJbR9Rr1yX6vSrzJxAwRE0DrxMD38/edit?usp=sharing";
+const SHEET_ID = "1NVibDl4n3VYDa5ZJbR9Rr1yX6vSrzJxAwRE0DrxMD38";
+const MENU_SHEET_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit?usp=sharing`;
 
-async function obtenerDatosMenuGoogleSheets() {
-  const sheetIdMatch = MENU_SHEET_URL.match(/\/d\/([a-zA-Z0-9-_]+)/);
-  const sheetId = sheetIdMatch?.[1] || "";
-  if (!sheetId) return [];
+// Caché de 10 minutos para evitar pegarle a Google Sheets en cada arranque/recarga.
+const SHEETS_CACHE_TTL_MS = 10 * 60 * 1000;
+const sheetsCache = new Map();
 
-  const csvUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&sheet=menu`;
+async function obtenerFilasDeHojaGoogleSheets(sheetName) {
+  const cached = sheetsCache.get(sheetName);
+  if (cached && Date.now() - cached.at < SHEETS_CACHE_TTL_MS) {
+    return cached.rows;
+  }
+  const csvUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&sheet=${encodeURIComponent(sheetName)}`;
   const response = await axios.get(csvUrl, { responseType: "text" });
   const workbook = XLSX.read(response.data, { type: "string" });
-  const sheet = workbook.Sheets["menu"] || workbook.Sheets[workbook.SheetNames[0]];
-  if (!sheet) return [];
-  return XLSX.utils.sheet_to_json(sheet);
+  const sheet =
+    workbook.Sheets[sheetName] || workbook.Sheets[workbook.SheetNames[0]];
+  const rows = sheet ? XLSX.utils.sheet_to_json(sheet) : [];
+  sheetsCache.set(sheetName, { at: Date.now(), rows });
+  return rows;
+}
+
+async function obtenerDatosMenuGoogleSheets() {
+  return obtenerFilasDeHojaGoogleSheets("menu");
 }
 
 async function cargarMenu() {
@@ -104,7 +115,6 @@ let complementosMenu = {};
 let bebidasItems = [];
 let bebidasMenu = {};
 let descripcionesMap = {};
-let menuExcelMtimeMs = 0;
 let ultimoChequeoArchivosAt = 0;
 const FILE_CHECK_INTERVAL_MS = 1500;
 
@@ -233,15 +243,6 @@ function cargarRestaurante() {
 
 let restaurante = cargarRestaurante();
 
-function inicializarExcelCache() {
-  try {
-    const st = fs.statSync("menu.xlsx");
-    menuExcelMtimeMs = st.mtimeMs || 0;
-  } catch {
-    menuExcelMtimeMs = 0;
-  }
-}
-
 function inicializarRestauranteCache() {
   try {
     const st = fs.statSync("restaurant.json");
@@ -255,7 +256,7 @@ async function recargarArchivosSiCambioThrottled() {
   const now = Date.now();
   if (now - ultimoChequeoArchivosAt < FILE_CHECK_INTERVAL_MS) return;
   ultimoChequeoArchivosAt = now;
-  await Promise.all([recargarExcelSiCambioAsync(), recargarRestauranteSiCambioAsync()]);
+  await recargarRestauranteSiCambioAsync();
 }
 
 async function recargarRestauranteSiCambioAsync() {
@@ -270,29 +271,6 @@ async function recargarRestauranteSiCambioAsync() {
     }
   } catch {
     // ignorar
-  }
-}
-
-async function recargarExcelSiCambioAsync() {
-  try {
-    const st = await fsp.stat("menu.xlsx");
-    const mtimeMs = st.mtimeMs || 0;
-    if (mtimeMs && mtimeMs !== menuExcelMtimeMs) {
-      menuExcelMtimeMs = mtimeMs;
-      menu = await cargarMenu();
-      const comp = cargarComplementos();
-      complementosItems = comp.items;
-      complementosMenu = comp.menu;
-      const beb = cargarBebidas();
-      bebidasItems = beb.items;
-      bebidasMenu = beb.menu;
-      descripcionesMap = cargarDescripciones();
-      rebuildDetectCache();
-      console.log("✅ Excel recargado: menú, complementos, bebidas y descripciones actualizados");
-    }
-  } catch {
-    // Si no se puede leer el archivo (por ejemplo, Excel lo tiene bloqueado),
-    // simplemente se sigue usando la versión anterior en memoria.
   }
 }
 
@@ -359,24 +337,22 @@ function capitalizar(s) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-// 🍟 COMPLEMENTOS (desde Excel)
-function cargarComplementos() {
+// 🍟 COMPLEMENTOS (desde Google Sheets, hoja "complementos")
+async function cargarComplementos() {
   const fallbackItems = [
     { nombre: "papas", precio: 50 },
     { nombre: "alitas", precio: 90 },
     { nombre: "boneless", precio: 100 }
   ];
 
-  try {
-    const workbook = XLSX.readFile("menu.xlsx");
-    const sheet = workbook.Sheets["complementos"];
-    if (!sheet) {
-      const menuFallback = {};
-      fallbackItems.forEach((c) => (menuFallback[c.nombre] = c.precio));
-      return { items: fallbackItems, menu: menuFallback };
-    }
+  const fallback = () => {
+    const menuFallback = {};
+    fallbackItems.forEach((c) => (menuFallback[c.nombre] = c.precio));
+    return { items: fallbackItems, menu: menuFallback };
+  };
 
-    const data = XLSX.utils.sheet_to_json(sheet);
+  try {
+    const data = await obtenerFilasDeHojaGoogleSheets("complementos");
     const items = [];
     const menu = {};
 
@@ -394,29 +370,11 @@ function cargarComplementos() {
       menu[nombre] = precio;
     });
 
-    if (items.length === 0) {
-      const menuFallback = {};
-      fallbackItems.forEach((c) => (menuFallback[c.nombre] = c.precio));
-      return { items: fallbackItems, menu: menuFallback };
-    }
-
+    if (items.length === 0) return fallback();
     return { items, menu };
   } catch {
-    const menuFallback = {};
-    fallbackItems.forEach((c) => (menuFallback[c.nombre] = c.precio));
-    return { items: fallbackItems, menu: menuFallback };
+    return fallback();
   }
-}
-
-{
-  const comp = cargarComplementos();
-  complementosItems = comp.items;
-  complementosMenu = comp.menu;
-  const beb = cargarBebidas();
-  bebidasItems = beb.items;
-  bebidasMenu = beb.menu;
-  descripcionesMap = cargarDescripciones();
-  rebuildDetectCache();
 }
 
 function textoListaComplementos() {
@@ -425,18 +383,15 @@ function textoListaComplementos() {
     .join("  \n");
 }
 
-function cargarBebidas() {
+async function cargarBebidas() {
   const fallback = { items: [], menu: {} };
   try {
-    const workbook = XLSX.readFile("menu.xlsx");
-    const sheet = workbook.Sheets["bebidas"];
-    if (!sheet) return fallback;
-    const data = XLSX.utils.sheet_to_json(sheet);
+    const data = await obtenerFilasDeHojaGoogleSheets("bebida");
     const items = [];
     const menuMap = {};
     data.forEach((row) => {
       const rawNombre =
-        row.bebida ?? row.bebidas ?? row.nombre ?? row.item;
+        row.bebidas ?? row.bebida ?? row.nombre ?? row.item;
       const rawPrecio = row.precio;
       if (rawNombre == null) return;
       const nombre = String(rawNombre).toLowerCase().trim();
@@ -451,29 +406,20 @@ function cargarBebidas() {
   }
 }
 
-function cargarDescripciones() {
+async function cargarDescripciones() {
   const map = {};
   try {
-    const workbook = XLSX.readFile("menu.xlsx");
-    const sheet = workbook.Sheets["descripciones"];
-    if (!sheet) return map;
-    const data = XLSX.utils.sheet_to_json(sheet);
+    const data = await obtenerFilasDeHojaGoogleSheets("descripciones");
     data.forEach((row) => {
       const pk =
         row.pizza != null
           ? String(row.pizza).toLowerCase().trim()
           : "";
       if (!pk || !menu[pk]) return;
-      const ing =
-        row.ingredientesTexto != null
-          ? String(row.ingredientesTexto).trim()
-          : row.ingredientes != null
-            ? String(row.ingredientes).trim()
-            : "";
       map[pk] = {
         descripcion:
           row.descripcion != null ? String(row.descripcion).trim() : "",
-        ingredientesTexto: ing
+        ingredientesTexto: ""
       };
     });
   } catch {
@@ -1414,7 +1360,7 @@ function porCerrar() {
 }
 
 // 💰 PRECIO
-// Calcula el precio usando la tabla cargada desde `menu.xlsx`.
+// Calcula el precio usando la tabla cargada desde Google Sheets (hoja `menu`).
 function calcularPrecio(ingredientes, tamano) {
   if (!Array.isArray(ingredientes) || ingredientes.length === 0) return 0;
 
@@ -2314,8 +2260,14 @@ async function aplicarPostEleccionSalsa(sock, from, estado, quien) {
 async function startBot() {
   const { useFirestoreAuthState } = require("./baileys-firestore-auth-state");
   menu = await cargarMenu();
+  const comp = await cargarComplementos();
+  complementosItems = comp.items;
+  complementosMenu = comp.menu;
+  const beb = await cargarBebidas();
+  bebidasItems = beb.items;
+  bebidasMenu = beb.menu;
+  descripcionesMap = await cargarDescripciones();
   rebuildDetectCache();
-  inicializarExcelCache();
   inicializarRestauranteCache();
   const { state, saveCreds } = await useFirestoreAuthState();
 
