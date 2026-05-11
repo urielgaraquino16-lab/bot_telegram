@@ -13,6 +13,7 @@
   "type": "commonjs",
   "dependencies": {
     "@google-cloud/dialogflow": "^7.5.0",
+    "@google/generative-ai": "^0.24.1",
     "@whiskeysockets/baileys": "^6.6.0",
     "axios": "^1.13.6",
     "express": "^5.1.0",

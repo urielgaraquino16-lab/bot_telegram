@@ -47,6 +47,33 @@ if (USE_DIALOGFLOW) {
   console.log("🤖 Dialogflow inactivo (configura DIALOGFLOW_PROJECT_ID para activarlo)");
 }
 
+// 🧠 Gemini AI — paso intermedio antes de escalar a un asesor humano.
+let GoogleGenerativeAI = null;
+try {
+  ({ GoogleGenerativeAI } = require("@google/generative-ai"));
+} catch {
+  GoogleGenerativeAI = null;
+}
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_MODEL_NAME = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+const GEMINI_SYSTEM_PROMPT =
+  "Eres un asistente amable de Pizzas Carly. Solo respondes preguntas sobre el menú, ingredientes, precios, promociones y políticas del negocio. Si no puedes responder con certeza, responde exactamente con la palabra: ESCALAR\nSé breve, máximo 3 líneas. No inventes precios.";
+
+const USE_GEMINI = !!(GoogleGenerativeAI && GEMINI_API_KEY);
+const geminiClient = USE_GEMINI ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
+const geminiModel = USE_GEMINI
+  ? geminiClient.getGenerativeModel({
+      model: GEMINI_MODEL_NAME,
+      systemInstruction: GEMINI_SYSTEM_PROMPT
+    })
+  : null;
+if (USE_GEMINI) {
+  console.log(`🧠 Gemini activo (modelo: ${GEMINI_MODEL_NAME})`);
+} else {
+  console.log("🧠 Gemini inactivo (configura GEMINI_API_KEY para activarlo)");
+}
+
 process.on("unhandledRejection", (reason) => {
   console.error("❌ unhandledRejection:", reason);
 });
@@ -891,6 +918,73 @@ async function detectarIntentDialogflow(sessionId, texto) {
   } catch (err) {
     console.error("❌ Dialogflow detectIntent error:", err?.message || err);
     return null;
+  }
+}
+
+function construirContextoGemini() {
+  const menuLines = [];
+  for (const [pizza, tamanos] of Object.entries(menu || {})) {
+    if (!tamanos || typeof tamanos !== "object") continue;
+    const partes = Object.entries(tamanos)
+      .map(([t, p]) => `${t}: $${p}`)
+      .join(", ");
+    menuLines.push(`- ${pizza}: ${partes}`);
+  }
+
+  const complementosLines = (complementosItems || []).map(
+    (c) => `- ${c.nombre}: $${c.precio}`
+  );
+
+  const descripcionesLines = [];
+  for (const [pizza, d] of Object.entries(descripcionesMap || {})) {
+    if (!d) continue;
+    const partes = [];
+    if (d.descripcion) partes.push(d.descripcion);
+    if (d.ingredientesTexto) partes.push(`ingredientes: ${d.ingredientesTexto}`);
+    if (partes.length) descripcionesLines.push(`- ${pizza}: ${partes.join(" | ")}`);
+  }
+
+  const promosTexto = restaurante?.promocionesTexto || "";
+  const promosListaArr = Array.isArray(restaurante?.promociones)
+    ? restaurante.promociones.map((p) => {
+        const nombre = p?.nombre || p?.titulo || p?.id || "promo";
+        const desc = p?.descripcion || p?.detalle || p?.texto || "";
+        return desc ? `- ${nombre}: ${desc}` : `- ${nombre}`;
+      })
+    : [];
+
+  return [
+    "MENÚ DE PIZZAS (precios por tamaño):",
+    menuLines.join("\n") || "(sin datos)",
+    "",
+    "COMPLEMENTOS Y BEBIDAS:",
+    complementosLines.join("\n") || "(sin datos)",
+    "",
+    "DESCRIPCIONES DE PIZZAS:",
+    descripcionesLines.join("\n") || "(sin datos)",
+    "",
+    "PROMOCIONES DEL DÍA:",
+    promosTexto || "(sin texto)",
+    promosListaArr.join("\n")
+  ]
+    .filter((x) => x !== "")
+    .join("\n");
+}
+
+async function responderConGemini(pregunta, contexto) {
+  if (!USE_GEMINI || !geminiModel) return "ESCALAR";
+
+  const ctx = contexto != null ? String(contexto) : construirContextoGemini();
+  const prompt = `Contexto del negocio:\n${ctx}\n\nPregunta del cliente:\n${pregunta}`;
+
+  try {
+    const result = await geminiModel.generateContent(prompt);
+    const text = (result?.response?.text?.() || "").trim();
+    if (!text) return "ESCALAR";
+    return text;
+  } catch (err) {
+    console.error("❌ Gemini error:", err?.message || err);
+    return "ESCALAR";
   }
 }
 
@@ -3615,15 +3709,25 @@ if (await responderIntentDialogflow(sock, from, estado, textoClean)) {
     estado.intentos++;
 
 if (estado.intentos >= 2) {
-  await sock.sendMessage(from, {
-    text: "👨‍💼 No estoy seguro de entender eso. Te paso con un asesor para que te ayude mejor."
-  });
-  await notificarUrgenteMovil(sock, {
-    waTitulo: "DERIVACIÓN A ASESOR",
-    waDetalle: `Bot no entendió\n📞 ${quien}\nJID: ${from}\n💬 ${textoClean}`,
-    tgTexto: `🚨 *URGENTE — Derivación (bot no entendió)*\n📞 ${quien}\nJID: ${from}\n💬 ${textoClean}`
-  });
-  estado.intentos = 0;
+  // Antes de derivar a un asesor humano, intentamos resolver con Gemini.
+  const respuestaGemini = await responderConGemini(textoClean);
+  const debeEscalar =
+    !respuestaGemini || /^ESCALAR\b/i.test(respuestaGemini.trim());
+
+  if (!debeEscalar) {
+    await sock.sendMessage(from, { text: respuestaGemini });
+    estado.intentos = 0;
+  } else {
+    await sock.sendMessage(from, {
+      text: "👨‍💼 No estoy seguro de entender eso. Te paso con un asesor para que te ayude mejor."
+    });
+    await notificarUrgenteMovil(sock, {
+      waTitulo: "DERIVACIÓN A ASESOR",
+      waDetalle: `Bot no entendió\n📞 ${quien}\nJID: ${from}\n💬 ${textoClean}`,
+      tgTexto: `🚨 *URGENTE — Derivación (bot no entendió)*\n📞 ${quien}\nJID: ${from}\n💬 ${textoClean}`
+    });
+    estado.intentos = 0;
+  }
 } else {
   await sock.sendMessage(from, {
     text: "🤖 No te caché bien.\n\nEscribe *menu* para empezar, *carrito* para ver total o *ayuda*."
