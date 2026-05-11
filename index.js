@@ -1997,10 +1997,14 @@ async function responderDescripcionPizza(textoClean) {
       if (d.descripcion) msg += `\n_${d.descripcion}_`;
       return msg;
     }
+    // La pizza no está en descripcionesMap: preguntamos a Gemini con el
+    // contexto completo del menú y enviamos su respuesta al cliente.
     const contexto = construirContextoGemini();
     const gemini = await responderConGemini(textoClean, contexto);
-    if (gemini && !/^ESCALAR\b/i.test(gemini.trim())) return gemini;
-    return `🍕 *${tit}*: no tengo ese detalle confirmado; pregunta con un asesor.`;
+    if (gemini && gemini.trim() && !/^ESCALAR\b/i.test(gemini.trim())) {
+      return gemini.trim();
+    }
+    return null;
   }
   return "🍕 Dime el *nombre de la pizza* (ej. ¿qué lleva la hawaiana?)";
 }
