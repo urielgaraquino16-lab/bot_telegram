@@ -1984,7 +1984,7 @@ function esPreguntaIngredientesPizza(textoClean) {
   );
 }
 
-function responderDescripcionPizza(textoClean) {
+async function responderDescripcionPizza(textoClean) {
   if (!esPreguntaIngredientesPizza(textoClean)) return null;
   const ings = detectarIngredientes(textoClean);
   if (ings.length >= 2) return null;
@@ -1997,7 +1997,10 @@ function responderDescripcionPizza(textoClean) {
       if (d.descripcion) msg += `\n_${d.descripcion}_`;
       return msg;
     }
-    return `🍕 *${tit}*: aún no tengo la descripción en el Excel (hoja *descripciones*); pregunta con un asesor.`;
+    const contexto = construirContextoGemini();
+    const gemini = await responderConGemini(textoClean, contexto);
+    if (gemini && !/^ESCALAR\b/i.test(gemini.trim())) return gemini;
+    return `🍕 *${tit}*: no tengo ese detalle confirmado; pregunta con un asesor.`;
   }
   return "🍕 Dime el *nombre de la pizza* (ej. ¿qué lleva la hawaiana?)";
 }
@@ -2193,7 +2196,7 @@ async function procesarConsultasPorComas(sock, from, textoClean) {
     let out =
       resolverConsultaPrecio(p) ||
       buscarRespuestaFaq(p) ||
-      responderDescripcionPizza(p) ||
+      (await responderDescripcionPizza(p)) ||
       responderServicioHorarioPromoCombo(p);
     if (!out && esPreguntaHorarioServicioPromoCombo(p)) {
       out = responderServicioHorarioPromoCombo(p);
@@ -2737,7 +2740,7 @@ if (esConsultaMitadMitadSoloPregunta(textoClean)) {
 {
   const rPrecio = resolverConsultaPrecio(textoClean);
   const rFaq = buscarRespuestaFaq(textoClean);
-  const rDesc = responderDescripcionPizza(textoClean);
+  const rDesc = await responderDescripcionPizza(textoClean);
   const preguntaCombo =
     (/(combo|paquete)/.test(textoClean) && (estado.paso === "inicio" || estado.paso === "menu"));
   if (preguntaCombo) {
