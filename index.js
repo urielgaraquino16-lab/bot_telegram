@@ -974,21 +974,80 @@ function construirContextoGemini() {
     .join("\n");
 }
 
-async function responderConGemini(pregunta, contexto) {
+const GEMINI_TIMEOUT_MS = 8000;
+const GEMINI_TIMEOUT_SENTINEL = "__TIMEOUT__";
+const GEMINI_MANEJADO_SENTINEL = "__GEMINI_MANEJADO__";
+
+async function responderConGemini(pregunta, contexto, timeoutMs = GEMINI_TIMEOUT_MS) {
   if (!USE_GEMINI || !geminiModel) return "ESCALAR";
 
   const ctx = contexto != null ? String(contexto) : construirContextoGemini();
   const prompt = `Contexto del negocio:\n${ctx}\n\nPregunta del cliente:\n${pregunta}`;
 
   try {
-    const result = await geminiModel.generateContent(prompt);
-    const text = (result?.response?.text?.() || "").trim();
-    if (!text) return "ESCALAR";
-    return text;
+    let timeoutHandle;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutHandle = setTimeout(
+        () => resolve(GEMINI_TIMEOUT_SENTINEL),
+        timeoutMs
+      );
+    });
+    const apiPromise = (async () => {
+      const result = await geminiModel.generateContent(prompt);
+      const text = (result?.response?.text?.() || "").trim();
+      return text || "ESCALAR";
+    })();
+    const respuesta = await Promise.race([apiPromise, timeoutPromise]);
+    clearTimeout(timeoutHandle);
+    if (respuesta === GEMINI_TIMEOUT_SENTINEL) {
+      console.warn(`⚠️ Gemini timeout (>${timeoutMs}ms)`);
+    }
+    return respuesta;
   } catch (err) {
     console.error("❌ Gemini error:", err?.message || err);
     return "ESCALAR";
   }
+}
+
+// Envia indicador de "consultando" antes de llamar a Gemini con timeout.
+// En timeout: avisa al cliente y escala a un asesor humano (notificarUrgenteMovil).
+// Devuelve { manejado, texto } donde:
+//   manejado=true -> ya enviamos mensaje/escalamos, el caller debe cortar el flujo
+//   manejado=false, texto=string -> respuesta valida de Gemini
+//   manejado=false, texto=null -> Gemini no aplica (ESCALAR / vacio), caller decide
+async function preguntarAGeminiConIndicador(sock, from, quien, pregunta, contexto) {
+  try {
+    await sock.sendMessage(from, { text: "🤔 Déjame consultar eso..." });
+  } catch (err) {
+    console.warn("Gemini indicador send error:", err?.message || err);
+  }
+
+  const respuesta = await responderConGemini(pregunta, contexto, GEMINI_TIMEOUT_MS);
+
+  if (respuesta === GEMINI_TIMEOUT_SENTINEL) {
+    try {
+      await sock.sendMessage(from, {
+        text: "Un momento, déjame verificar eso con un asesor."
+      });
+    } catch (err) {
+      console.warn("Gemini timeout msg error:", err?.message || err);
+    }
+    try {
+      await notificarUrgenteMovil(sock, {
+        waTitulo: "ESCALAR (timeout Gemini)",
+        waDetalle: `Gemini >${GEMINI_TIMEOUT_MS}ms\n📞 ${quien || "?"}\nJID: ${from}\n💬 ${pregunta}`,
+        tgTexto: `🚨 *Timeout Gemini*\n📞 ${quien || "?"}\nJID: ${from}\n💬 ${pregunta}`
+      });
+    } catch (err) {
+      console.warn("Gemini timeout notify error:", err?.message || err);
+    }
+    return { manejado: true, texto: null };
+  }
+
+  if (!respuesta || /^ESCALAR\b/i.test(String(respuesta).trim())) {
+    return { manejado: false, texto: null };
+  }
+  return { manejado: false, texto: String(respuesta).trim() };
 }
 
 async function responderIntentDialogflow(sock, from, estado, textoClean) {
@@ -1982,12 +2041,12 @@ function detectarSaludoOMenu(textoClean) {
 
 function esPreguntaIngredientesPizza(textoClean) {
   const x = sinAcentos(normalizarTextoPedido(textoClean));
-  return /(que\s+lleva|lleva\s+que|que\s+tiene|ingredientes|de\s+que\s+esta|descripcion|describe)/.test(
+  return /(que\s+lleva|lleva\s+que|que\s+tiene|ingredientes|de\s+que\s+es|descripcion|describe)/.test(
     x
   );
 }
 
-async function responderDescripcionPizza(textoClean) {
+async function responderDescripcionPizza(textoClean, sock, from, quien) {
   if (!esPreguntaIngredientesPizza(textoClean)) return null;
   const ings = detectarIngredientes(textoClean);
   if (ings.length >= 2) return null;
@@ -2001,8 +2060,20 @@ async function responderDescripcionPizza(textoClean) {
       return msg;
     }
     // La pizza no está en descripcionesMap: preguntamos a Gemini con el
-    // contexto completo del menú y enviamos su respuesta al cliente.
+    // contexto del menú. Cuando hay sock/from disponibles, usamos el
+    // wrapper con indicador de "consultando" + timeout + escalamiento.
     const contexto = construirContextoGemini();
+    if (sock && from) {
+      const r = await preguntarAGeminiConIndicador(
+        sock,
+        from,
+        quien,
+        textoClean,
+        contexto
+      );
+      if (r.manejado) return GEMINI_MANEJADO_SENTINEL;
+      return r.texto;
+    }
     const gemini = await responderConGemini(textoClean, contexto);
     if (gemini && gemini.trim() && !/^ESCALAR\b/i.test(gemini.trim())) {
       return gemini.trim();
@@ -2190,7 +2261,7 @@ function requiereHumPorAlitasComplejas(textoClean) {
   return false;
 }
 
-async function procesarConsultasPorComas(sock, from, textoClean) {
+async function procesarConsultasPorComas(sock, from, textoClean, quien) {
   if (!textoClean.includes(",")) return false;
   const partes = textoClean
     .split(",")
@@ -2200,11 +2271,15 @@ async function procesarConsultasPorComas(sock, from, textoClean) {
 
   const salidas = [];
   for (const p of partes) {
+    const rPrecio = resolverConsultaPrecio(p);
+    const rFaq = !rPrecio ? buscarRespuestaFaq(p) : null;
+    let rDesc = null;
+    if (!rPrecio && !rFaq) {
+      rDesc = await responderDescripcionPizza(p, sock, from, quien);
+      if (rDesc === GEMINI_MANEJADO_SENTINEL) return true;
+    }
     let out =
-      resolverConsultaPrecio(p) ||
-      buscarRespuestaFaq(p) ||
-      (await responderDescripcionPizza(p)) ||
-      responderServicioHorarioPromoCombo(p);
+      rPrecio || rFaq || rDesc || responderServicioHorarioPromoCombo(p);
     if (!out && esPreguntaHorarioServicioPromoCombo(p)) {
       out = responderServicioHorarioPromoCombo(p);
     }
@@ -2479,6 +2554,43 @@ const textoClean = sinAcentos(textoLower.trim());
 
 console.log("📩", textoClean);
 estado.lastUserMessageAt = Date.now();
+
+// 🧠 Si el cliente está en estado "inicio" y arranca preguntando por
+// ingredientes/descripción de una pizza, contestamos directo con Gemini
+// (saltando el saludo genérico) usando el contexto del menú.
+if (
+  estado.paso === "inicio" &&
+  textoClean &&
+  esPreguntaIngredientesPizza(textoClean)
+) {
+  const contexto = `
+MENÚ DE PIZZAS CARLY:
+${JSON.stringify(menu)}
+
+COMPLEMENTOS:
+${complementosItems.map(c => `${c.nombre}: $${c.precio}`).join('\n')}
+
+DESCRIPCIONES:
+${Object.entries(descripcionesMap).map(([k,v]) => `${k}: ${v.ingredientesTexto || v.descripcion || ""}`).join('\n')}
+`;
+
+  const r = await preguntarAGeminiConIndicador(
+    sock,
+    from,
+    quien,
+    textoClean,
+    contexto
+  );
+  if (r.manejado) {
+    estado.saludoInicialEnviado = true;
+    return;
+  }
+  if (r.texto) {
+    estado.saludoInicialEnviado = true;
+    await sock.sendMessage(from, { text: r.texto });
+    return;
+  }
+}
 
 // 🤖 Saludo inicial (solo primera vez) - sin importar qué escriba el cliente.
 if (esNuevoCliente && !estado.saludoInicialEnviado && textoClean) {
@@ -2758,7 +2870,7 @@ if (
   return;
 }
 
-if (await procesarConsultasPorComas(sock, from, textoClean)) return;
+if (await procesarConsultasPorComas(sock, from, textoClean, quien)) return;
 
 if (esConsultaMitadMitadSoloPregunta(textoClean)) {
   estado.paso = "esperando_dos_sabores_mitad";
@@ -2771,7 +2883,8 @@ if (esConsultaMitadMitadSoloPregunta(textoClean)) {
 {
   const rPrecio = resolverConsultaPrecio(textoClean);
   const rFaq = buscarRespuestaFaq(textoClean);
-  const rDesc = await responderDescripcionPizza(textoClean);
+  const rDesc = await responderDescripcionPizza(textoClean, sock, from, quien);
+  if (rDesc === GEMINI_MANEJADO_SENTINEL) return;
   const preguntaCombo =
     (/(combo|paquete)/.test(textoClean) && (estado.paso === "inicio" || estado.paso === "menu"));
   if (preguntaCombo) {
@@ -3755,12 +3868,18 @@ DESCRIPCIONES:
 ${Object.entries(descripcionesMap).map(([k,v]) => `${k}: ${v.ingredientesTexto}`).join('\n')}
 `;
 
-  const respuestaGemini = await responderConGemini(textoClean, contexto);
-  const debeEscalar =
-    !respuestaGemini || /^ESCALAR\b/i.test(respuestaGemini.trim());
+  const r = await preguntarAGeminiConIndicador(
+    sock,
+    from,
+    quien,
+    textoClean,
+    contexto
+  );
 
-  if (!debeEscalar) {
-    await sock.sendMessage(from, { text: respuestaGemini });
+  if (r.manejado) {
+    estado.intentos = 0;
+  } else if (r.texto) {
+    await sock.sendMessage(from, { text: r.texto });
     estado.intentos = 0;
   } else {
     await sock.sendMessage(from, {
