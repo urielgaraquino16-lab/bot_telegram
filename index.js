@@ -32,24 +32,6 @@ try {
   firestore = null;
   console.warn("Firestore no disponible, usando persistencia local. Detalle:", err?.message || err);
 }
-let dialogflow = null;
-try {
-  dialogflow = require("@google-cloud/dialogflow");
-} catch {
-  dialogflow = null;
-}
-
-const DIALOGFLOW_PROJECT_ID = process.env.DIALOGFLOW_PROJECT_ID || "";
-const DIALOGFLOW_LANGUAGE_CODE = process.env.DIALOGFLOW_LANGUAGE_CODE || "es";
-const DIALOGFLOW_CONFIDENCE_MIN = Number(process.env.DIALOGFLOW_CONFIDENCE_MIN || 0.72);
-const USE_DIALOGFLOW = !!(dialogflow && DIALOGFLOW_PROJECT_ID);
-const dialogflowSessionClient = USE_DIALOGFLOW ? new dialogflow.SessionsClient() : null;
-if (USE_DIALOGFLOW) {
-  console.log(`🤖 Dialogflow activo (project: ${DIALOGFLOW_PROJECT_ID})`);
-} else {
-  console.log("🤖 Dialogflow inactivo (configura DIALOGFLOW_PROJECT_ID para activarlo)");
-}
-
 // 🧠 Gemini AI — paso intermedio antes de escalar a un asesor humano.
 let GoogleGenerativeAI = null;
 try {
@@ -894,36 +876,6 @@ async function sendText(sock, to, estado, text) {
   }
 }
 
-async function detectarIntentDialogflow(sessionId, texto) {
-  if (!USE_DIALOGFLOW || !dialogflowSessionClient) return null;
-  const txt = String(texto || "").trim();
-  if (!txt) return null;
-  try {
-    const sessionPath = dialogflowSessionClient.projectAgentSessionPath(
-      DIALOGFLOW_PROJECT_ID,
-      sessionId
-    );
-    const request = {
-      session: sessionPath,
-      queryInput: {
-        text: { text: txt, languageCode: DIALOGFLOW_LANGUAGE_CODE }
-      }
-    };
-    const [response] = await dialogflowSessionClient.detectIntent(request);
-    const qr = response?.queryResult || {};
-    const confidence = Number(qr.intentDetectionConfidence || 0);
-    if (!qr.intent?.displayName || confidence < DIALOGFLOW_CONFIDENCE_MIN) return null;
-    return {
-      intent: qr.intent.displayName,
-      confidence,
-      fulfillment: String(qr.fulfillmentText || "").trim()
-    };
-  } catch (err) {
-    console.error("❌ Dialogflow detectIntent error:", err?.message || err);
-    return null;
-  }
-}
-
 function construirContextoGemini() {
   const menuLines = [];
   for (const [pizza, tamanos] of Object.entries(menu || {})) {
@@ -1048,35 +1000,6 @@ async function preguntarAGeminiConIndicador(sock, from, quien, pregunta, context
     return { manejado: false, texto: null };
   }
   return { manejado: false, texto: String(respuesta).trim() };
-}
-
-async function responderIntentDialogflow(sock, from, estado, textoClean) {
-  const sessionId = String(from || "")
-    .replace(/[^a-zA-Z0-9_-]/g, "_")
-    .slice(0, 120);
-  const hit = await detectarIntentDialogflow(sessionId, textoClean);
-  if (!hit) return false;
-  const i = sinAcentos(hit.intent.toLowerCase());
-
-  if (/asesor|humano/.test(i)) {
-    await sendText(sock, from, estado, "👨‍💼 Te paso con alguien del equipo en un momentito.");
-    return true;
-  }
-  if (/carrito|resumen|total/.test(i)) {
-    const rd = resumenDetalladoPedidoParaCliente(estado);
-    await sendText(sock, from, estado, rd ? `🧾 *Así va tu pedido*\n\n${rd}` : "Todavía no tienes nada en el pedido.");
-    return true;
-  }
-  if (/cancel/.test(i)) {
-    resetEstadoCliente(from, estado);
-    await sendText(sock, from, estado, "❌ Pedido cancelado.\n\nEscribe *hola* para empezar de nuevo.");
-    return true;
-  }
-  if (hit.fulfillment) {
-    await sendText(sock, from, estado, hit.fulfillment);
-    return true;
-  }
-  return false;
 }
 
 function numeroDesdeTexto(t) {
@@ -3848,11 +3771,6 @@ if (estado.paso === "promo") {
 
     return;
   }
-}
-
-// 🤖 Fallback NLU (Dialogflow) para lenguaje libre sin romper flujo principal
-if (await responderIntentDialogflow(sock, from, estado, textoClean)) {
-  return;
 }
 
     // 🤖 DEFAULT
