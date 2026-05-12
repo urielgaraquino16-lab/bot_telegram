@@ -1,5 +1,7 @@
 /**
  * Persistencia de sesión Baileys en Firestore (misma forma que useMultiFileAuthState).
+ * Optimizado para minimizar escrituras: caché en memoria + comparación, omisión
+ * de no-ops y debounce de 30 s en saveCreds para no exceder la cuota gratuita.
  */
 const { initAuthCreds } = require("@whiskeysockets/baileys/lib/Utils/auth-utils");
 const { BufferJSON } = require("@whiskeysockets/baileys/lib/Utils/generics");
@@ -10,13 +12,28 @@ const { firestore } = require("./firebase");
 const fixFileName = (file) =>
   file?.replace(/\//g, "__")?.replace(/:/g, "-");
 
+// Marca un archivo como "no existe en Firestore" en la caché. Sirve para evitar
+// emitir un .delete() repetidamente sobre algo que ya borramos antes.
+const TOMBSTONE = "__TOMBSTONE__";
+
+// file -> último payload (string JSON) que efectivamente escribimos/leímos,
+// o TOMBSTONE si confirmamos que no existe.
+const cacheValores = new Map();
+
 async function leerCredencialesDesdeFirestore(colRef, file) {
   try {
     const id = fixFileName(file);
     const snap = await colRef.doc(id).get();
-    if (!snap.exists) return null;
+    if (!snap.exists) {
+      cacheValores.set(file, TOMBSTONE);
+      return null;
+    }
     const payload = snap.data()?.payload;
-    if (typeof payload !== "string" || !payload) return null;
+    if (typeof payload !== "string" || !payload) {
+      cacheValores.set(file, TOMBSTONE);
+      return null;
+    }
+    cacheValores.set(file, payload);
     return JSON.parse(payload, BufferJSON.reviver);
   } catch (err) {
     console.warn("Firestore leerCredenciales:", err?.message || err);
@@ -28,7 +45,11 @@ async function guardarCredencialesEnFirestore(colRef, data, file) {
   try {
     const id = fixFileName(file);
     const json = JSON.stringify(data, BufferJSON.replacer);
+    // Si el valor serializado es idéntico al último que escribimos, no
+    // emitimos otra operación (ahorra cuota de Firestore).
+    if (cacheValores.get(file) === json) return;
     await colRef.doc(id).set({ payload: json });
+    cacheValores.set(file, json);
   } catch (err) {
     console.warn("Firestore guardarCredenciales:", err?.message || err);
   }
@@ -36,8 +57,11 @@ async function guardarCredencialesEnFirestore(colRef, data, file) {
 
 async function eliminarCredencialesEnFirestore(colRef, file) {
   try {
+    // Ya está marcado como borrado: no emitimos otro delete.
+    if (cacheValores.get(file) === TOMBSTONE) return;
     const id = fixFileName(file);
     await colRef.doc(id).delete();
+    cacheValores.set(file, TOMBSTONE);
   } catch (err) {
     console.warn("Firestore eliminarCredenciales:", err?.message || err);
   }
@@ -62,6 +86,38 @@ async function useFirestoreAuthState() {
   } catch {
     creds = initAuthCreds();
   }
+
+  // 🕒 Debounce de 30 s para saveCreds: aunque Baileys lo invoque muchas veces,
+  // a lo mucho escribimos una vez cada 30 s. Como `creds` se actualiza por
+  // referencia, el flush siempre persiste la versión más reciente.
+  const SAVE_CREDS_INTERVAL_MS = 30 * 1000;
+  let saveCredsTimer = null;
+  let saveCredsLastFlushAt = 0;
+
+  const flushCredsAhora = async () => {
+    saveCredsLastFlushAt = Date.now();
+    await writeData(creds, "creds.json");
+  };
+
+  const saveCreds = () => {
+    // Si ya hay un flush pendiente, no agendamos otro: el actual escribirá
+    // la versión más reciente de `creds` cuando dispare.
+    if (saveCredsTimer) return Promise.resolve();
+
+    const sinceLast = Date.now() - saveCredsLastFlushAt;
+    if (sinceLast >= SAVE_CREDS_INTERVAL_MS) {
+      return flushCredsAhora();
+    }
+
+    const esperar = SAVE_CREDS_INTERVAL_MS - sinceLast;
+    saveCredsTimer = setTimeout(() => {
+      saveCredsTimer = null;
+      flushCredsAhora().catch((err) =>
+        console.warn("Firestore saveCreds (flush):", err?.message || err)
+      );
+    }, esperar);
+    return Promise.resolve();
+  };
 
   return {
     state: {
@@ -103,7 +159,7 @@ async function useFirestoreAuthState() {
         }
       }
     },
-    saveCreds: () => writeData(creds, "creds.json")
+    saveCreds
   };
 }
 

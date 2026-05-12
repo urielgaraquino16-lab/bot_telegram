@@ -1355,8 +1355,11 @@ async function registrarEventoMetricas(evento, payload = {}) {
     };
     await fsp.appendFile("metricas.jsonl", JSON.stringify(row) + "\n", "utf8");
 
-    if (firestore) {
-      // Best-effort: no bloquea el flujo del bot.
+    // Métricas en Firestore: opt-in vía METRICAS_FIRESTORE=1.
+    // Por defecto NO se escriben a Firestore para no consumir cuota
+    // gratuita (siguen en metricas.jsonl local). Los pedidos confirmados
+    // siguen guardándose vía guardarPedido().
+    if (firestore && process.env.METRICAS_FIRESTORE === "1") {
       firestore
         .collection("metricas")
         .add(row)
