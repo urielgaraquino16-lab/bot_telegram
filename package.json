@@ -12,11 +12,11 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
     "@whiskeysockets/baileys": "^6.6.0",
     "axios": "^1.13.6",
     "express": "^5.1.0",
     "firebase-admin": "^13.7.0",
+    "groq": "npm:groq-sdk@^1.2.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "xlsx": "^0.18.5"

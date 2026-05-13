@@ -32,31 +32,25 @@ try {
   firestore = null;
   console.warn("Firestore no disponible, usando persistencia local. Detalle:", err?.message || err);
 }
-// 🧠 Gemini AI — paso intermedio antes de escalar a un asesor humano.
-let GoogleGenerativeAI = null;
+// 🤖 Groq (LLM). En package.json la dependencia se llama `groq` y apunta a groq-sdk (npm alias).
+let GroqCtor = null;
 try {
-  ({ GoogleGenerativeAI } = require("@google/generative-ai"));
+  GroqCtor = require("groq").Groq;
 } catch {
-  GoogleGenerativeAI = null;
+  GroqCtor = null;
 }
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL_NAME = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const GEMINI_SYSTEM_PROMPT =
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const GROQ_MODEL_NAME = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const GROQ_SYSTEM_PROMPT =
   "Eres un asistente amable de Pizzas Carly. Solo respondes preguntas sobre el menú, ingredientes, precios, promociones y políticas del negocio. Si no puedes responder con certeza, responde exactamente con la palabra: ESCALAR\nSé breve, máximo 3 líneas. No inventes precios.";
 
-const USE_GEMINI = !!(GoogleGenerativeAI && GEMINI_API_KEY);
-const geminiClient = USE_GEMINI ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
-const geminiModel = USE_GEMINI
-  ? geminiClient.getGenerativeModel({
-      model: GEMINI_MODEL_NAME,
-      systemInstruction: GEMINI_SYSTEM_PROMPT
-    })
-  : null;
-if (USE_GEMINI) {
-  console.log(`🧠 Gemini activo (modelo: ${GEMINI_MODEL_NAME})`);
+const USE_GROQ = !!(GroqCtor && GROQ_API_KEY);
+const groqClient = USE_GROQ ? new GroqCtor({ apiKey: GROQ_API_KEY }) : null;
+if (USE_GROQ) {
+  console.log(`🤖 Groq activo (modelo: ${GROQ_MODEL_NAME})`);
 } else {
-  console.log("🧠 Gemini inactivo (configura GEMINI_API_KEY para activarlo)");
+  console.log("🤖 Groq inactivo (configura GROQ_API_KEY e instala el paquete groq)");
 }
 
 process.on("unhandledRejection", (reason) => {
@@ -876,7 +870,7 @@ async function sendText(sock, to, estado, text) {
   }
 }
 
-function construirContextoGemini() {
+function construirContextoCatalogo() {
   const menuLines = [];
   for (const [pizza, tamanos] of Object.entries(menu || {})) {
     if (!tamanos || typeof tamanos !== "object") continue;
@@ -926,51 +920,58 @@ function construirContextoGemini() {
     .join("\n");
 }
 
-const GEMINI_TIMEOUT_MS = 15000;
-const GEMINI_INDICADOR_DELAY_MS = 2000;
-const GEMINI_TIMEOUT_SENTINEL = "__TIMEOUT__";
-const GEMINI_MANEJADO_SENTINEL = "__GEMINI_MANEJADO__";
+const GROQ_TIMEOUT_MS = 15000;
+const GROQ_INDICADOR_DELAY_MS = 2000;
+const GROQ_TIMEOUT_SENTINEL = "__TIMEOUT__";
+const GROQ_MANEJADO_SENTINEL = "__GROQ_MANEJADO__";
 
-async function responderConGemini(pregunta, contexto, timeoutMs = GEMINI_TIMEOUT_MS) {
-  if (!USE_GEMINI || !geminiModel) return "ESCALAR";
+async function responderConGroq(pregunta, contexto, timeoutMs = GROQ_TIMEOUT_MS) {
+  if (!USE_GROQ || !groqClient) return "ESCALAR";
 
-  const ctx = contexto != null ? String(contexto) : construirContextoGemini();
-  const prompt = `Contexto del negocio:\n${ctx}\n\nPregunta del cliente:\n${pregunta}`;
+  const ctx = contexto != null ? String(contexto) : construirContextoCatalogo();
+  const userContent = `Contexto del negocio:\n${ctx}\n\nPregunta del cliente:\n${pregunta}`;
 
   try {
     let timeoutHandle;
     const timeoutPromise = new Promise((resolve) => {
       timeoutHandle = setTimeout(
-        () => resolve(GEMINI_TIMEOUT_SENTINEL),
+        () => resolve(GROQ_TIMEOUT_SENTINEL),
         timeoutMs
       );
     });
     const apiPromise = (async () => {
-      const result = await geminiModel.generateContent(prompt);
-      const text = (result?.response?.text?.() || "").trim();
+      const completion = await groqClient.chat.completions.create({
+        model: GROQ_MODEL_NAME,
+        messages: [
+          { role: "system", content: GROQ_SYSTEM_PROMPT },
+          { role: "user", content: userContent }
+        ],
+        temperature: 0.4,
+        max_tokens: 256
+      });
+      const text = String(completion?.choices?.[0]?.message?.content || "").trim();
       return text || "ESCALAR";
     })();
     const respuesta = await Promise.race([apiPromise, timeoutPromise]);
     clearTimeout(timeoutHandle);
-    if (respuesta === GEMINI_TIMEOUT_SENTINEL) {
-      console.warn(`⚠️ Gemini timeout (>${timeoutMs}ms)`);
+    if (respuesta === GROQ_TIMEOUT_SENTINEL) {
+      console.warn(`⚠️ Groq timeout (>${timeoutMs}ms)`);
     }
     return respuesta;
   } catch (err) {
-    console.error("❌ Gemini error:", err?.message || err);
+    console.error("❌ Groq error:", err?.message || err);
     return "ESCALAR";
   }
 }
 
-// Envia indicador de "consultando" antes de llamar a Gemini con timeout.
-// En timeout: avisa al cliente y escala a un asesor humano (notificarUrgenteMovil).
+// Indicador "consultando" diferido + timeout + escalamiento (misma logica que antes).
 // Devuelve { manejado, texto } donde:
 //   manejado=true -> ya enviamos mensaje/escalamos, el caller debe cortar el flujo
-//   manejado=false, texto=string -> respuesta valida de Gemini
-//   manejado=false, texto=null -> Gemini no aplica (ESCALAR / vacio), caller decide
-async function preguntarAGeminiConIndicador(sock, from, quien, pregunta, contexto) {
-  // El indicador "Déjame consultar eso..." se envia solo si Gemini tarda
-  // mas de GEMINI_INDICADOR_DELAY_MS; asi evitamos mensajes dobles cuando
+//   manejado=false, texto=string -> respuesta valida del LLM
+//   manejado=false, texto=null -> ESCALAR / vacio, caller decide
+async function preguntarAGroqConIndicador(sock, from, quien, pregunta, contexto) {
+  // El indicador "Déjame consultar eso..." se envia solo si el LLM tarda
+  // mas de GROQ_INDICADOR_DELAY_MS; asi evitamos mensajes dobles cuando
   // la respuesta llega rapido.
   let indicadorEnviado = false;
   const indicadorTimer = setTimeout(() => {
@@ -978,30 +979,30 @@ async function preguntarAGeminiConIndicador(sock, from, quien, pregunta, context
     sock
       .sendMessage(from, { text: "🤔 Déjame consultar eso..." })
       .catch((err) =>
-        console.warn("Gemini indicador send error:", err?.message || err)
+        console.warn("Groq indicador send error:", err?.message || err)
       );
-  }, GEMINI_INDICADOR_DELAY_MS);
+  }, GROQ_INDICADOR_DELAY_MS);
 
-  const respuesta = await responderConGemini(pregunta, contexto, GEMINI_TIMEOUT_MS);
+  const respuesta = await responderConGroq(pregunta, contexto, GROQ_TIMEOUT_MS);
   clearTimeout(indicadorTimer);
   void indicadorEnviado;
 
-  if (respuesta === GEMINI_TIMEOUT_SENTINEL) {
+  if (respuesta === GROQ_TIMEOUT_SENTINEL) {
     try {
       await sock.sendMessage(from, {
         text: "Un momento, déjame verificar eso con un asesor."
       });
     } catch (err) {
-      console.warn("Gemini timeout msg error:", err?.message || err);
+      console.warn("Groq timeout msg error:", err?.message || err);
     }
     try {
       await notificarUrgenteMovil(sock, {
-        waTitulo: "ESCALAR (timeout Gemini)",
-        waDetalle: `Gemini >${GEMINI_TIMEOUT_MS}ms\n📞 ${quien || "?"}\nJID: ${from}\n💬 ${pregunta}`,
-        tgTexto: `🚨 *Timeout Gemini*\n📞 ${quien || "?"}\nJID: ${from}\n💬 ${pregunta}`
+        waTitulo: "ESCALAR (timeout Groq)",
+        waDetalle: `Groq >${GROQ_TIMEOUT_MS}ms\n📞 ${quien || "?"}\nJID: ${from}\n💬 ${pregunta}`,
+        tgTexto: `🚨 *Timeout Groq*\n📞 ${quien || "?"}\nJID: ${from}\n💬 ${pregunta}`
       });
     } catch (err) {
-      console.warn("Gemini timeout notify error:", err?.message || err);
+      console.warn("Groq timeout notify error:", err?.message || err);
     }
     return { manejado: true, texto: null };
   }
@@ -1995,24 +1996,24 @@ async function responderDescripcionPizza(textoClean, sock, from, quien) {
       if (d.descripcion) msg += `\n_${d.descripcion}_`;
       return msg;
     }
-    // La pizza no está en descripcionesMap: preguntamos a Gemini con el
+    // La pizza no está en descripcionesMap: preguntamos a Groq con el
     // contexto del menú. Cuando hay sock/from disponibles, usamos el
     // wrapper con indicador de "consultando" + timeout + escalamiento.
-    const contexto = construirContextoGemini();
+    const contexto = construirContextoCatalogo();
     if (sock && from) {
-      const r = await preguntarAGeminiConIndicador(
+      const r = await preguntarAGroqConIndicador(
         sock,
         from,
         quien,
         textoClean,
         contexto
       );
-      if (r.manejado) return GEMINI_MANEJADO_SENTINEL;
+      if (r.manejado) return GROQ_MANEJADO_SENTINEL;
       return r.texto;
     }
-    const gemini = await responderConGemini(textoClean, contexto);
-    if (gemini && gemini.trim() && !/^ESCALAR\b/i.test(gemini.trim())) {
-      return gemini.trim();
+    const respGroq = await responderConGroq(textoClean, contexto);
+    if (respGroq && respGroq.trim() && !/^ESCALAR\b/i.test(respGroq.trim())) {
+      return respGroq.trim();
     }
     return null;
   }
@@ -2212,7 +2213,7 @@ async function procesarConsultasPorComas(sock, from, textoClean, quien) {
     let rDesc = null;
     if (!rPrecio && !rFaq) {
       rDesc = await responderDescripcionPizza(p, sock, from, quien);
-      if (rDesc === GEMINI_MANEJADO_SENTINEL) return true;
+      if (rDesc === GROQ_MANEJADO_SENTINEL) return true;
     }
     let out =
       rPrecio || rFaq || rDesc || responderServicioHorarioPromoCombo(p);
@@ -2492,7 +2493,7 @@ console.log("📩", textoClean);
 estado.lastUserMessageAt = Date.now();
 
 // 🧠 Si el cliente está en estado "inicio" y arranca preguntando por
-// ingredientes/descripción de una pizza, contestamos directo con Gemini
+// ingredientes/descripción de una pizza, contestamos directo con Groq
 // (saltando el saludo genérico) usando el contexto del menú.
 if (
   estado.paso === "inicio" &&
@@ -2510,7 +2511,7 @@ DESCRIPCIONES:
 ${Object.entries(descripcionesMap).map(([k,v]) => `${k}: ${v.ingredientesTexto || v.descripcion || ""}`).join('\n')}
 `;
 
-  const r = await preguntarAGeminiConIndicador(
+  const r = await preguntarAGroqConIndicador(
     sock,
     from,
     quien,
@@ -2820,7 +2821,7 @@ if (esConsultaMitadMitadSoloPregunta(textoClean)) {
   const rPrecio = resolverConsultaPrecio(textoClean);
   const rFaq = buscarRespuestaFaq(textoClean);
   const rDesc = await responderDescripcionPizza(textoClean, sock, from, quien);
-  if (rDesc === GEMINI_MANEJADO_SENTINEL) return;
+  if (rDesc === GROQ_MANEJADO_SENTINEL) return;
   const preguntaCombo =
     (/(combo|paquete)/.test(textoClean) && (estado.paso === "inicio" || estado.paso === "menu"));
   if (preguntaCombo) {
@@ -3787,7 +3788,7 @@ if (estado.paso === "promo") {
     estado.intentos++;
 
 if (estado.intentos >= 2) {
-  // Antes de derivar a un asesor humano, intentamos resolver con Gemini.
+  // Antes de derivar a un asesor humano, intentamos resolver con Groq.
   const contexto = `
 MENÚ DE PIZZAS CARLY:
 ${JSON.stringify(menu)}
@@ -3799,7 +3800,7 @@ DESCRIPCIONES:
 ${Object.entries(descripcionesMap).map(([k,v]) => `${k}: ${v.ingredientesTexto}`).join('\n')}
 `;
 
-  const r = await preguntarAGeminiConIndicador(
+  const r = await preguntarAGroqConIndicador(
     sock,
     from,
     quien,
