@@ -926,7 +926,8 @@ function construirContextoGemini() {
     .join("\n");
 }
 
-const GEMINI_TIMEOUT_MS = 8000;
+const GEMINI_TIMEOUT_MS = 15000;
+const GEMINI_INDICADOR_DELAY_MS = 2000;
 const GEMINI_TIMEOUT_SENTINEL = "__TIMEOUT__";
 const GEMINI_MANEJADO_SENTINEL = "__GEMINI_MANEJADO__";
 
@@ -968,13 +969,22 @@ async function responderConGemini(pregunta, contexto, timeoutMs = GEMINI_TIMEOUT
 //   manejado=false, texto=string -> respuesta valida de Gemini
 //   manejado=false, texto=null -> Gemini no aplica (ESCALAR / vacio), caller decide
 async function preguntarAGeminiConIndicador(sock, from, quien, pregunta, contexto) {
-  try {
-    await sock.sendMessage(from, { text: "🤔 Déjame consultar eso..." });
-  } catch (err) {
-    console.warn("Gemini indicador send error:", err?.message || err);
-  }
+  // El indicador "Déjame consultar eso..." se envia solo si Gemini tarda
+  // mas de GEMINI_INDICADOR_DELAY_MS; asi evitamos mensajes dobles cuando
+  // la respuesta llega rapido.
+  let indicadorEnviado = false;
+  const indicadorTimer = setTimeout(() => {
+    indicadorEnviado = true;
+    sock
+      .sendMessage(from, { text: "🤔 Déjame consultar eso..." })
+      .catch((err) =>
+        console.warn("Gemini indicador send error:", err?.message || err)
+      );
+  }, GEMINI_INDICADOR_DELAY_MS);
 
   const respuesta = await responderConGemini(pregunta, contexto, GEMINI_TIMEOUT_MS);
+  clearTimeout(indicadorTimer);
+  void indicadorEnviado;
 
   if (respuesta === GEMINI_TIMEOUT_SENTINEL) {
     try {
