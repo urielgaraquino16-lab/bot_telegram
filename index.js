@@ -41,7 +41,7 @@ try {
 }
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL_NAME = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL_NAME = process.env.GEMINI_MODEL || "gemini-2.5-flash-preview-05-20";
 const GEMINI_SYSTEM_PROMPT =
   "Eres un asistente amable de Pizzas Carly. Solo respondes preguntas sobre el menú, ingredientes, precios, promociones y políticas del negocio. Si no puedes responder con certeza, responde exactamente con la palabra: ESCALAR\nSé breve, máximo 3 líneas. No inventes precios.";
 
