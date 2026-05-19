@@ -71,6 +71,59 @@ const MENU_SHEET_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit?
 const SHEETS_CACHE_TTL_MS = 10 * 60 * 1000;
 const sheetsCache = new Map();
 
+function urlGoogleSheetGviz(sheetName) {
+  return `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}`;
+}
+
+/** Parsea respuesta de Google Visualization API (gviz/tq?...&sheet=nombre). */
+function parsearRespuestaGvizJson(texto) {
+  const raw = String(texto ?? "").trim();
+  let jsonText = raw;
+  const wrapped = raw.match(/setResponse\(([\s\S]+)\)\s*;?\s*$/);
+  if (wrapped) jsonText = wrapped[1];
+
+  const payload = JSON.parse(jsonText);
+  if (payload.status === "error") {
+    const msg =
+      payload.errors?.[0]?.detailed_message ||
+      payload.errors?.[0]?.message ||
+      "Error gviz";
+    throw new Error(msg);
+  }
+
+  const table = payload.table;
+  if (!table?.rows?.length) return [];
+
+  const cols = (table.cols || []).map((c) =>
+    String(c.label ?? c.id ?? "")
+      .toLowerCase()
+      .trim()
+  );
+
+  return table.rows.map((row) => {
+    const obj = {};
+    (row.c || []).forEach((cell, i) => {
+      const key = cols[i] || `col${i}`;
+      obj[key] =
+        cell == null || cell.v === null || cell.v === undefined ? "" : cell.v;
+    });
+    return obj;
+  });
+}
+
+async function obtenerFilasDeHojaGoogleSheetsGviz(sheetName) {
+  const cacheKey = `gviz:${sheetName}`;
+  const cached = sheetsCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < SHEETS_CACHE_TTL_MS) {
+    return cached.rows;
+  }
+  const url = urlGoogleSheetGviz(sheetName);
+  const response = await axios.get(url, { responseType: "text" });
+  const rows = parsearRespuestaGvizJson(response.data);
+  sheetsCache.set(cacheKey, { at: Date.now(), rows });
+  return rows;
+}
+
 async function obtenerFilasDeHojaGoogleSheets(sheetName) {
   const cached = sheetsCache.get(sheetName);
   if (cached && Date.now() - cached.at < SHEETS_CACHE_TTL_MS) {
@@ -424,37 +477,29 @@ function normalizarFilaGoogleSheet(row) {
 async function cargarDescripciones() {
   const map = {};
   const sheetName = "descripciones";
-  const csvUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&sheet=${encodeURIComponent(sheetName)}`;
+  const gvizUrl = urlGoogleSheetGviz(sheetName);
 
   console.log("📋 cargarDescripciones — SHEET_ID:", SHEET_ID);
-  console.log("📋 cargarDescripciones — URL consultada:", csvUrl);
+  console.log("📋 cargarDescripciones — hoja:", sheetName);
+  console.log("📋 cargarDescripciones — URL consultada (gviz):", gvizUrl);
 
   try {
-    const response = await axios.get(csvUrl, { responseType: "text" });
-    const csvCrudo = String(response.data ?? "");
+    // gviz/tq con &sheet=descripciones — el export CSV a veces devuelve la 1ª hoja (menu).
+    const response = await axios.get(gvizUrl, { responseType: "text" });
+    const crudo = String(response.data ?? "");
     console.log("📋 cargarDescripciones — HTTP status:", response.status);
     console.log(
-      "📋 cargarDescripciones — CSV crudo (primeros 800 chars):",
-      csvCrudo.slice(0, 800) || "(vacío)"
+      "📋 cargarDescripciones — respuesta cruda (primeros 800 chars):",
+      crudo.slice(0, 800) || "(vacío)"
     );
 
-    const workbook = XLSX.read(csvCrudo, { type: "string" });
-    console.log(
-      "📋 cargarDescripciones — hojas detectadas en CSV:",
-      workbook.SheetNames
-    );
-
-    const sheet =
-      workbook.Sheets[sheetName] || workbook.Sheets[workbook.SheetNames[0]];
-    const data = sheet ? XLSX.utils.sheet_to_json(sheet) : [];
+    const data = parsearRespuestaGvizJson(crudo);
+    sheetsCache.set(`gviz:${sheetName}`, { at: Date.now(), rows: data });
 
     console.log(
-      "📋 cargarDescripciones — datos crudos (filas parseadas):",
+      "📋 cargarDescripciones — datos crudos (filas parseadas, columnas pizza/descripcion):",
       JSON.stringify(data, null, 2)
     );
-
-    // Actualizar caché compartida con el resto del bot
-    sheetsCache.set(sheetName, { at: Date.now(), rows: data });
 
     let omitidasSinTexto = 0;
     data.forEach((row, idx) => {
