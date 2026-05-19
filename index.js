@@ -75,14 +75,40 @@ function urlGoogleSheetGviz(sheetName) {
   return `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}`;
 }
 
-/** Parsea respuesta de Google Visualization API (gviz/tq?...&sheet=nombre). */
-function parsearRespuestaGvizJson(texto) {
-  const raw = String(texto ?? "").trim();
-  let jsonText = raw;
-  const wrapped = raw.match(/setResponse\(([\s\S]+)\)\s*;?\s*$/);
-  if (wrapped) jsonText = wrapped[1];
+function valorCeldaGviz(cell) {
+  if (cell == null) return "";
+  if (cell.v === null || cell.v === undefined) return "";
+  return cell.v;
+}
 
+/** Extrae JSON puro de la respuesta gviz (comentario O_o + setResponse). */
+function extraerJsonDeRespuestaGviz(texto) {
+  let s = String(texto ?? "").trim();
+  s = s.replace(/^\/\*[\s\S]*?\*\/\s*/g, "");
+  const marker = "google.visualization.Query.setResponse(";
+  const idx = s.indexOf(marker);
+  if (idx >= 0) {
+    s = s.slice(idx + marker.length);
+  } else {
+    const idx2 = s.indexOf("setResponse(");
+    if (idx2 >= 0) s = s.slice(idx2 + "setResponse(".length);
+  }
+  if (s.endsWith(");")) {
+    s = s.slice(0, -2);
+  } else if (s.endsWith(")")) {
+    s = s.slice(0, -1);
+  }
+  return s.trim();
+}
+
+/**
+ * Parsea respuesta gviz/tq. La primera fila de table.rows son headers (c[0].v, c[1].v…);
+ * las siguientes filas son datos.
+ */
+function parsearRespuestaGvizJson(texto) {
+  const jsonText = extraerJsonDeRespuestaGviz(texto);
   const payload = JSON.parse(jsonText);
+
   if (payload.status === "error") {
     const msg =
       payload.errors?.[0]?.detailed_message ||
@@ -92,20 +118,27 @@ function parsearRespuestaGvizJson(texto) {
   }
 
   const table = payload.table;
-  if (!table?.rows?.length) return [];
+  const allRows = table?.rows;
+  if (!Array.isArray(allRows) || allRows.length === 0) return [];
 
-  const cols = (table.cols || []).map((c) =>
-    String(c.label ?? c.id ?? "")
+  const headerCells = allRows[0]?.c || [];
+  const headers = headerCells.map((cell, i) => {
+    const fromCell = String(valorCeldaGviz(cell) || "")
       .toLowerCase()
-      .trim()
-  );
+      .trim();
+    if (fromCell) return fromCell;
+    const fromCol = table.cols?.[i];
+    return String(fromCol?.label ?? fromCol?.id ?? `col${i}`)
+      .toLowerCase()
+      .trim();
+  });
 
-  return table.rows.map((row) => {
+  const dataRows = allRows.slice(1);
+  return dataRows.map((row) => {
     const obj = {};
     (row.c || []).forEach((cell, i) => {
-      const key = cols[i] || `col${i}`;
-      obj[key] =
-        cell == null || cell.v === null || cell.v === undefined ? "" : cell.v;
+      const key = headers[i] || `col${i}`;
+      obj[key] = valorCeldaGviz(cell);
     });
     return obj;
   });
