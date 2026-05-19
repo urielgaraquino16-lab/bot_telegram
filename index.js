@@ -1122,6 +1122,8 @@ function detectarBebidasEnTexto(textoClean) {
 }
 
 function detectarPedidoDirecto(textoClean) {
+  if (esPreguntaIngredientesPizza(textoClean)) return null;
+
   const t = normalizarTextoPedido(textoClean);
   const pareceSoloConsulta =
     esConsultaPrecio(textoClean) &&
@@ -1978,46 +1980,94 @@ function detectarSaludoOMenu(textoClean) {
 
 function esPreguntaIngredientesPizza(textoClean) {
   const x = sinAcentos(normalizarTextoPedido(textoClean));
-  return /(que\s+lleva|lleva\s+que|que\s+tiene|ingredientes|de\s+que\s+es|descripcion|describe)/.test(
+  return /(?:que\s+lleva|que\s+tiene|lleva\s+que|ingredientes?\s+(?:de|del|de\s+la)?|de\s+que\s+(?:es|esta)|descripcion|describe|con\s+que\s+viene)/.test(
     x
   );
 }
 
+const PASOS_SIN_CONSULTA_DESCRIPCION = new Set([
+  "cantidad_complemento",
+  "agregar_mas",
+  "confirmar",
+  "confirmar_complementos",
+  "elegir_salsa_complemento",
+  "clarificar_salsa_mitad_o_dos",
+  "resolver_ambiguedad_complemento",
+  "direccion",
+  "esperando_humano"
+]);
+
+function puedeResponderConsultaDescripcion(paso) {
+  return !PASOS_SIN_CONSULTA_DESCRIPCION.has(paso);
+}
+
+/** Respuesta local desde descripcionesMap si hay una sola pizza detectada. */
+function textoDescripcionLocalPizza(textoClean) {
+  const ings = detectarIngredientes(textoClean);
+  if (ings.length !== 1) return null;
+  const d = descripcionesMap[ings[0]];
+  if (!d || (!d.ingredientesTexto && !d.descripcion)) return null;
+  const tit = capitalizar(ings[0]);
+  let msg = `🍕 *${tit}*`;
+  if (d.ingredientesTexto) msg += `\n📋 ${d.ingredientesTexto}`;
+  if (d.descripcion) msg += `\n_${d.descripcion}_`;
+  return msg;
+}
+
+/**
+ * Pregunta de ingredientes/descripción: Groq con contexto del menú.
+ * No pide tamaño ni entra al flujo de pedido.
+ * @returns {Promise<boolean>} true si ya respondió al cliente
+ */
+async function manejarConsultaDescripcionPizza(sock, from, quien, textoClean) {
+  if (!esPreguntaIngredientesPizza(textoClean)) return false;
+
+  const local = textoDescripcionLocalPizza(textoClean);
+  if (local) {
+    await sock.sendMessage(from, { text: local });
+    return true;
+  }
+
+  const contexto = construirContextoCatalogo();
+  const r = await preguntarAGroqConIndicador(sock, from, quien, textoClean, contexto);
+  if (r.manejado) return true;
+  if (r.texto) {
+    await sock.sendMessage(from, { text: r.texto });
+    return true;
+  }
+
+  const ings = detectarIngredientes(textoClean);
+  if (ings.length === 0) {
+    await sock.sendMessage(from, {
+      text: "🍕 Dime el *nombre de la pizza* (ej. ¿qué lleva la hawaiana?)"
+    });
+    return true;
+  }
+  return false;
+}
+
 async function responderDescripcionPizza(textoClean, sock, from, quien) {
   if (!esPreguntaIngredientesPizza(textoClean)) return null;
-  const ings = detectarIngredientes(textoClean);
-  if (ings.length >= 2) return null;
-  if (ings.length === 1) {
-    const d = descripcionesMap[ings[0]];
-    const tit = capitalizar(ings[0]);
-    if (d && (d.ingredientesTexto || d.descripcion)) {
-      let msg = `🍕 *${tit}*`;
-      if (d.ingredientesTexto) msg += `\n📋 ${d.ingredientesTexto}`;
-      if (d.descripcion) msg += `\n_${d.descripcion}_`;
-      return msg;
-    }
-    // La pizza no está en descripcionesMap: preguntamos a Groq con el
-    // contexto del menú. Cuando hay sock/from disponibles, usamos el
-    // wrapper con indicador de "consultando" + timeout + escalamiento.
-    const contexto = construirContextoCatalogo();
-    if (sock && from) {
-      const r = await preguntarAGroqConIndicador(
-        sock,
-        from,
-        quien,
-        textoClean,
-        contexto
-      );
-      if (r.manejado) return GROQ_MANEJADO_SENTINEL;
-      return r.texto;
-    }
-    const respGroq = await responderConGroq(textoClean, contexto);
-    if (respGroq && respGroq.trim() && !/^ESCALAR\b/i.test(respGroq.trim())) {
-      return respGroq.trim();
-    }
+
+  const local = textoDescripcionLocalPizza(textoClean);
+  if (local) return local;
+
+  const contexto = construirContextoCatalogo();
+  if (sock && from) {
+    const r = await preguntarAGroqConIndicador(sock, from, quien, textoClean, contexto);
+    if (r.manejado) return GROQ_MANEJADO_SENTINEL;
+    if (r.texto) return r.texto;
     return null;
   }
-  return "🍕 Dime el *nombre de la pizza* (ej. ¿qué lleva la hawaiana?)";
+
+  const respGroq = await responderConGroq(textoClean, contexto);
+  if (respGroq && respGroq.trim() && !/^ESCALAR\b/i.test(respGroq.trim())) {
+    return respGroq.trim();
+  }
+  if (detectarIngredientes(textoClean).length === 0) {
+    return "🍕 Dime el *nombre de la pizza* (ej. ¿qué lleva la hawaiana?)";
+  }
+  return null;
 }
 
 function precioDeExtra(ex, tamano) {
@@ -2492,41 +2542,14 @@ const textoClean = sinAcentos(textoLower.trim());
 console.log("📩", textoClean);
 estado.lastUserMessageAt = Date.now();
 
-// 🧠 Si el cliente está en estado "inicio" y arranca preguntando por
-// ingredientes/descripción de una pizza, contestamos directo con Groq
-// (saltando el saludo genérico) usando el contexto del menú.
+// 🍕 Pregunta de ingredientes/descripción → Groq (antes del flujo de pedido; no pide tamaño).
 if (
-  estado.paso === "inicio" &&
   textoClean &&
-  esPreguntaIngredientesPizza(textoClean)
+  puedeResponderConsultaDescripcion(estado.paso) &&
+  (await manejarConsultaDescripcionPizza(sock, from, quien, textoClean))
 ) {
-  const contexto = `
-MENÚ DE PIZZAS CARLY:
-${JSON.stringify(menu)}
-
-COMPLEMENTOS:
-${complementosItems.map(c => `${c.nombre}: $${c.precio}`).join('\n')}
-
-DESCRIPCIONES:
-${Object.entries(descripcionesMap).map(([k,v]) => `${k}: ${v.ingredientesTexto || v.descripcion || ""}`).join('\n')}
-`;
-
-  const r = await preguntarAGroqConIndicador(
-    sock,
-    from,
-    quien,
-    textoClean,
-    contexto
-  );
-  if (r.manejado) {
-    estado.saludoInicialEnviado = true;
-    return;
-  }
-  if (r.texto) {
-    estado.saludoInicialEnviado = true;
-    await sock.sendMessage(from, { text: r.texto });
-    return;
-  }
+  if (estado.paso === "inicio") estado.saludoInicialEnviado = true;
+  return;
 }
 
 // 🤖 Saludo inicial (solo primera vez) - sin importar qué escriba el cliente.
@@ -3576,6 +3599,11 @@ if (estado.paso === "decision") {
 
 // 🍕 PEDIDO INTELIGENTE
 if (estado.paso === "pedido") {
+  if (esPreguntaIngredientesPizza(textoClean)) {
+    if (await manejarConsultaDescripcionPizza(sock, from, quien, textoClean)) {
+      return;
+    }
+  }
 
   const ingredientesDetectados = detectarIngredientes(textoClean);
   const tamanoDetectado = detectarTamano(textoClean);
@@ -3657,6 +3685,11 @@ if (estado.paso === "pedido") {
 
 // 📏 SELECCIÓN DE TAMAÑO
 if (estado.paso === "tamano") {
+  if (esPreguntaIngredientesPizza(textoClean)) {
+    if (await manejarConsultaDescripcionPizza(sock, from, quien, textoClean)) {
+      return;
+    }
+  }
 
   const mapa = {
     "1": "mediana",
