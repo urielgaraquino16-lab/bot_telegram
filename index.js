@@ -63,8 +63,8 @@ process.on("uncaughtException", (err) => {
 
 
 
-// 💲 PRECIOS
-const SHEET_ID = "1NVibDl4n3VYDa5ZJbR9Rr1yX6vSrzJxAwRE0DrxMD38";
+// 💲 PRECIOS (Google Sheet debe estar compartido: "Cualquier persona con el enlace")
+const SHEET_ID = "1eFn39-QsH7IFjIneniztsV9MCyX1_Gdv3yhYMVVku4A";
 const MENU_SHEET_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit?usp=sharing`;
 
 // Caché de 10 minutos para evitar pegarle a Google Sheets en cada arranque/recarga.
@@ -124,23 +124,22 @@ async function obtenerFilasDeHojaGoogleSheetsGviz(sheetName) {
   return rows;
 }
 
-async function obtenerFilasDeHojaGoogleSheets(sheetName) {
-  const cached = sheetsCache.get(sheetName);
-  if (cached && Date.now() - cached.at < SHEETS_CACHE_TTL_MS) {
-    return cached.rows;
+function normalizarFilaGoogleSheet(row) {
+  const out = {};
+  if (!row || typeof row !== "object") return out;
+  for (const [k, v] of Object.entries(row)) {
+    out[String(k).toLowerCase().trim()] = v;
   }
-  const csvUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&sheet=${encodeURIComponent(sheetName)}`;
-  const response = await axios.get(csvUrl, { responseType: "text" });
-  const workbook = XLSX.read(response.data, { type: "string" });
-  const sheet =
-    workbook.Sheets[sheetName] || workbook.Sheets[workbook.SheetNames[0]];
-  const rows = sheet ? XLSX.utils.sheet_to_json(sheet) : [];
-  sheetsCache.set(sheetName, { at: Date.now(), rows });
-  return rows;
+  return out;
+}
+
+/** Lee una hoja por nombre vía gviz (menu, descripciones, complementos, bebida). */
+async function obtenerFilasDeHojaGoogleSheets(sheetName) {
+  return obtenerFilasDeHojaGoogleSheetsGviz(sheetName);
 }
 
 async function obtenerDatosMenuGoogleSheets() {
-  return obtenerFilasDeHojaGoogleSheets("menu");
+  return obtenerFilasDeHojaGoogleSheetsGviz("menu");
 }
 
 async function cargarMenu() {
@@ -149,9 +148,14 @@ async function cargarMenu() {
     const menu = {};
 
     data.forEach((row) => {
-      const pizza = row.pizza.toLowerCase().trim();
-      const tamaño = row.tamaño.toLowerCase().trim();
-      const precio = Number(row.precio);
+      const r = normalizarFilaGoogleSheet(row);
+      const pizza =
+        r.pizza != null ? String(r.pizza).toLowerCase().trim() : "";
+      const tamanoRaw = r.tamaño ?? r.tamano ?? r["tamaño"];
+      const tamaño =
+        tamanoRaw != null ? String(tamanoRaw).toLowerCase().trim() : "";
+      const precio = Number(r.precio);
+      if (!pizza || !tamaño || Number.isNaN(precio)) return;
 
       if (!menu[pizza]) {
         menu[pizza] = {};
@@ -161,7 +165,8 @@ async function cargarMenu() {
     });
 
     return menu;
-  } catch {
+  } catch (err) {
+    console.warn("⚠️ cargarMenu error:", err?.message || err);
     return {};
   }
 }
@@ -411,14 +416,15 @@ async function cargarComplementos() {
   };
 
   try {
-    const data = await obtenerFilasDeHojaGoogleSheets("complementos");
+    const data = await obtenerFilasDeHojaGoogleSheetsGviz("complementos");
     const items = [];
     const menu = {};
 
     data.forEach((row) => {
+      const r = normalizarFilaGoogleSheet(row);
       const rawNombre =
-        row.complementos ?? row.complemento ?? row.nombre ?? row.item;
-      const rawPrecio = row.precio;
+        r.complementos ?? r.complemento ?? r.nombre ?? r.item;
+      const rawPrecio = r.precio;
       if (rawNombre == null) return;
 
       const nombre = String(rawNombre).toLowerCase().trim();
@@ -445,13 +451,14 @@ function textoListaComplementos() {
 async function cargarBebidas() {
   const fallback = { items: [], menu: {} };
   try {
-    const data = await obtenerFilasDeHojaGoogleSheets("bebida");
+    const data = await obtenerFilasDeHojaGoogleSheetsGviz("bebida");
     const items = [];
     const menuMap = {};
     data.forEach((row) => {
+      const r = normalizarFilaGoogleSheet(row);
       const rawNombre =
-        row.bebidas ?? row.bebida ?? row.nombre ?? row.item;
-      const rawPrecio = row.precio;
+        r.bebidas ?? r.bebida ?? r.nombre ?? r.item;
+      const rawPrecio = r.precio;
       if (rawNombre == null) return;
       const nombre = String(rawNombre).toLowerCase().trim();
       const precio = Number(rawPrecio);
@@ -465,15 +472,6 @@ async function cargarBebidas() {
   }
 }
 
-function normalizarFilaGoogleSheet(row) {
-  const out = {};
-  if (!row || typeof row !== "object") return out;
-  for (const [k, v] of Object.entries(row)) {
-    out[String(k).toLowerCase().trim()] = v;
-  }
-  return out;
-}
-
 async function cargarDescripciones() {
   const map = {};
   const sheetName = "descripciones";
@@ -481,23 +479,13 @@ async function cargarDescripciones() {
 
   console.log("📋 cargarDescripciones — SHEET_ID:", SHEET_ID);
   console.log("📋 cargarDescripciones — hoja:", sheetName);
-  console.log("📋 cargarDescripciones — URL consultada (gviz):", gvizUrl);
+  console.log("📋 cargarDescripciones — URL (gviz):", gvizUrl);
 
   try {
-    // gviz/tq con &sheet=descripciones — el export CSV a veces devuelve la 1ª hoja (menu).
-    const response = await axios.get(gvizUrl, { responseType: "text" });
-    const crudo = String(response.data ?? "");
-    console.log("📋 cargarDescripciones — HTTP status:", response.status);
-    console.log(
-      "📋 cargarDescripciones — respuesta cruda (primeros 800 chars):",
-      crudo.slice(0, 800) || "(vacío)"
-    );
-
-    const data = parsearRespuestaGvizJson(crudo);
-    sheetsCache.set(`gviz:${sheetName}`, { at: Date.now(), rows: data });
+    const data = await obtenerFilasDeHojaGoogleSheetsGviz(sheetName);
 
     console.log(
-      "📋 cargarDescripciones — datos crudos (filas parseadas, columnas pizza/descripcion):",
+      "📋 cargarDescripciones — datos crudos (pizza / descripcion):",
       JSON.stringify(data, null, 2)
     );
 
