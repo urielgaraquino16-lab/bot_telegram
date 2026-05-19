@@ -48,8 +48,9 @@ const MENSAJE_FUERA_HORARIO =
   "😊 Hola! Estamos cerrados por el momento.\nAbrimos todos los días a las 12:00 PM.\n¡Te esperamos mañana! 🍕";
 const MENSAJE_REACTIVACION_BOT =
   "😊 Hola de nuevo, soy Carly.\n¿Te puedo ayudar con algo? 🍕";
-const TEXTO_CIERRE_PEDIDO_CARLY =
-  "¡Listo! 🎉 Tu pedido está en camino.\n⏱ Tiempo estimado: 30-40 minutos.\n¡Gracias por elegir Pizzas Carly! 🍕";
+const PROCESANDO_MAX_MS = 45000;
+const MENSAJE_PASO_A_HUMANO =
+  "🙌 ¡Perfecto! Ya te paso con alguien del equipo para cerrar tu pedido.\nEn un momentito te escriben 👋🍕";
 
 const USE_GROQ = !!(GroqCtor && GROQ_API_KEY);
 const groqClient = USE_GROQ ? new GroqCtor({ apiKey: GROQ_API_KEY }) : null;
@@ -1188,11 +1189,18 @@ function serializarEstadoCliente(estado) {
   return lines.length ? lines.join("\n") : "- Cliente nuevo / conversación general";
 }
 
+function textoConfirmacionPedidoCarly(estado) {
+  const resumen = resumenDetalladoPedidoParaCliente(estado);
+  const { total } = subtotalesPedidoActuales(estado);
+  const cuerpo = resumen || "Tu pedido quedó anotado 🍕";
+  return `✅ ¡Va! Te confirmo tu pedido:\n\n${cuerpo}\n\n💰 *Total: $${total}*\n\n¿Todo bien? Responde *SÍ* y te paso con alguien del equipo para cerrarlo 🍕😊`;
+}
+
 function construirSystemPromptCarly(estado) {
   return `Eres Carly, asistente amigable de Pizzas Carly 🍕
-Hablas de forma natural, cálida y paciente.
+Hablas de forma natural, cálida, divertida y cercana (como una amiga en la pizzería).
 Mensajes cortos, máximo 3 líneas.
-Usas emojis con moderación.
+Usa emojis con naturalidad (2 a 4 por mensaje: 🍕😊🛵✨).
 
 MENÚ ACTUAL:
 ${construirTextoMenuParaPrompt()}
@@ -1220,7 +1228,8 @@ REGLAS:
 - Si el cliente se confunde, simplifica y guíalo con opciones numeradas.
 - En paso B muestra tamaños con precios de la pizza elegida (1 mediana, 2 grande, etc.).
 - En paso D muestra complementos con precios del menú.
-- En paso G muestra resumen completo y pide confirmar con SÍ.`;
+- En paso G NO inventes el resumen: el bot ya envió "Te confirmo tu pedido"; si el cliente duda, aclara amablemente que debe responder SÍ para pasarlo con el equipo.
+- Tono siempre positivo y con emojis, sin sonar robótica.`;
 }
 
 function sugerirPizzaSimilar(texto) {
@@ -1331,7 +1340,7 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       estado.subPasoDireccion = "calle";
     } else if (/(recoger|pickup|paso|tienda|local|recojo)/.test(textoClean)) {
       estado.tipoServicio = "recoger";
-      estado.pasoPedido = "G";
+      marcarPasoConfirmacionPedido(estado);
     }
     return;
   }
@@ -1350,8 +1359,14 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       estado.direccionCompleta = `${estado.dirCalle} | Entre ${estado.dirEntre} | Ref: ${estado.dirReferencia}`;
       estado.subPasoDireccion = null;
       estado.pasoPedido = "G";
+      estado.pendienteEnvioConfirmacion = true;
     }
   }
+}
+
+function marcarPasoConfirmacionPedido(estado) {
+  estado.pasoPedido = "G";
+  estado.pendienteEnvioConfirmacion = true;
 }
 
 function jidEsAdmin(jid) {
@@ -1437,7 +1452,7 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     const lng = msg.message.locationMessage.degreesLongitude;
     if (estado.pasoPedido === "F" || estado.tipoServicio === "domicilio") {
       estado.direccionCompleta = `Ubicación: https://maps.google.com/?q=${lat},${lng}`;
-      estado.pasoPedido = "G";
+      marcarPasoConfirmacionPedido(estado);
       estado.subPasoDireccion = null;
     } else {
       await sendText(
@@ -1452,8 +1467,14 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
 
   actualizarEstadoDesdeMensaje(estado, texto, textoClean);
 
+  if (estado.pendienteEnvioConfirmacion && estado.pasoPedido === "G") {
+    estado.pendienteEnvioConfirmacion = false;
+    await sendText(sock, from, estado, textoConfirmacionPedidoCarly(estado));
+    return;
+  }
+
   if (estado.pasoPedido === "G" && esAfirmacionSimple(textoClean)) {
-    await cerrarPedidoCarly(sock, from, estado, quien);
+    await confirmarPedidoYPasarAHumano(sock, from, estado, quien);
     return;
   }
 
@@ -1484,21 +1505,16 @@ async function activarModoHumano(sock, from, estado, quien, motivo = "") {
   await registrarEventoMetricas("escalado_humano", { from, motivo: detalle || "ESCALAR" });
 }
 
-async function cerrarPedidoCarly(sock, from, estado, quien) {
+async function confirmarPedidoYPasarAHumano(sock, from, estado, quien) {
   const resumen = resumenDetalladoPedidoParaCliente(estado);
   const { total } = subtotalesPedidoActuales(estado);
   const dir =
     estado.tipoServicio === "domicilio"
-      ? estado.direccionCompleta || [estado.dirCalle, estado.dirEntre, estado.dirReferencia].filter(Boolean).join(" | ")
+      ? estado.direccionCompleta ||
+        [estado.dirCalle, estado.dirEntre, estado.dirReferencia].filter(Boolean).join(" | ")
       : "Recoger en tienda";
 
-  const payload = `🍕 *PEDIDO CONFIRMADO (Carly)*\n\n📞 ${quien}\nJID: ${from}\n📍 ${dir}\n\n${resumen || "—"}\n💰 Total: $${total}`;
-
-  await notificarUrgenteMovil(sock, {
-    waTitulo: "PEDIDO CONFIRMADO",
-    waDetalle: payload,
-    tgTexto: payload
-  });
+  const payload = `🍕 *PEDIDO — PASAR A COLABORADOR*\n\n📞 ${quien}\nJID: ${from}\n📍 ${dir}\n\n${resumen || "—"}\n💰 Total: $${total}`;
 
   try {
     const telefono = String(from || "").replace(/@.+$/, "");
@@ -1519,12 +1535,22 @@ Fecha: ${new Date().toLocaleString()}
     await registrarPedidoEnStorage(pedidoGuardar);
     ultimoPedidoPorCliente[from] = snapshotPedido(estado);
   } catch (err) {
-    console.error("❌ cerrarPedidoCarly:", err?.message || err);
+    console.error("❌ confirmarPedidoYPasarAHumano:", err?.message || err);
   }
 
-  estado.pasoPedido = "H";
-  await sendText(sock, from, estado, TEXTO_CIERRE_PEDIDO_CARLY);
-  resetEstadoCliente(from, estado);
+  await sendText(sock, from, estado, MENSAJE_PASO_A_HUMANO);
+  await notificarUrgenteMovil(sock, {
+    waTitulo: "PEDIDO CONFIRMADO — ATENDER",
+    waDetalle: payload,
+    tgTexto: payload
+  });
+  await registrarEventoMetricas("pedido_confirmado_paso_humano", { from });
+
+  estado.modoHumano = true;
+  estado.tiempoEscalado = Date.now();
+  estado.pasoPedido = null;
+  estado.pendienteEnvioConfirmacion = false;
+  estado.historialGroq = [];
 }
 
 const GROQ_TIMEOUT_MS = 15000;
@@ -1827,7 +1853,8 @@ function nuevoEstadoCliente() {
     dirReferencia: null,
     direccionCompleta: null,
     subPasoDireccion: null,
-    pizzaSugerida: null
+    pizzaSugerida: null,
+    pendienteEnvioConfirmacion: false
   };
 }
 
@@ -3251,21 +3278,30 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
 
   if (await manejarComandoAdmin(sock, from, texto)) return;
 
-  if (estado.procesando) return;
-  estado.procesando = true;
+  const st = estados[from];
+  if (!st) return;
+  if (st.procesando) return;
+
+  st.procesando = true;
+  const liberarProcesando = () => {
+    if (estados[from]) estados[from].procesando = false;
+  };
+  const watchdog = setTimeout(liberarProcesando, PROCESANDO_MAX_MS);
+
   try {
     await procesarConversacionCarly(
       sock,
       msg,
       from,
       quien,
-      estado,
+      st,
       texto,
       textoClean,
       esNuevoCliente
     );
   } finally {
-    estado.procesando = false;
+    clearTimeout(watchdog);
+    liberarProcesando();
   }
   return;
   } catch (err) {
