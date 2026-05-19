@@ -412,31 +412,80 @@ async function cargarBebidas() {
   }
 }
 
+function normalizarFilaGoogleSheet(row) {
+  const out = {};
+  if (!row || typeof row !== "object") return out;
+  for (const [k, v] of Object.entries(row)) {
+    out[String(k).toLowerCase().trim()] = v;
+  }
+  return out;
+}
+
 async function cargarDescripciones() {
   const map = {};
+  const sheetName = "descripciones";
+  const csvUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&sheet=${encodeURIComponent(sheetName)}`;
+
+  console.log("📋 cargarDescripciones — SHEET_ID:", SHEET_ID);
+  console.log("📋 cargarDescripciones — URL consultada:", csvUrl);
+
   try {
-    const data = await obtenerFilasDeHojaGoogleSheets("descripciones");
+    const response = await axios.get(csvUrl, { responseType: "text" });
+    const csvCrudo = String(response.data ?? "");
+    console.log("📋 cargarDescripciones — HTTP status:", response.status);
+    console.log(
+      "📋 cargarDescripciones — CSV crudo (primeros 800 chars):",
+      csvCrudo.slice(0, 800) || "(vacío)"
+    );
+
+    const workbook = XLSX.read(csvCrudo, { type: "string" });
+    console.log(
+      "📋 cargarDescripciones — hojas detectadas en CSV:",
+      workbook.SheetNames
+    );
+
+    const sheet =
+      workbook.Sheets[sheetName] || workbook.Sheets[workbook.SheetNames[0]];
+    const data = sheet ? XLSX.utils.sheet_to_json(sheet) : [];
+
+    console.log(
+      "📋 cargarDescripciones — datos crudos (filas parseadas):",
+      JSON.stringify(data, null, 2)
+    );
+
+    // Actualizar caché compartida con el resto del bot
+    sheetsCache.set(sheetName, { at: Date.now(), rows: data });
+
     let omitidasSinTexto = 0;
-    data.forEach((row) => {
+    data.forEach((row, idx) => {
+      const r = normalizarFilaGoogleSheet(row);
       const pk =
-        row.pizza != null
-          ? String(row.pizza).toLowerCase().trim()
+        r.pizza != null && String(r.pizza).trim()
+          ? String(r.pizza).toLowerCase().trim()
           : "";
-      if (!pk) return;
+      if (!pk) {
+        console.warn(
+          `📋 cargarDescripciones — fila ${idx + 1} sin columna pizza:`,
+          row
+        );
+        return;
+      }
 
       const descripcion =
-        row.descripcion != null
-          ? String(row.descripcion).trim()
-          : "";
+        r.descripcion != null ? String(r.descripcion).trim() : "";
       const ingredientesTexto =
-        row.ingredientesTexto != null
-          ? String(row.ingredientesTexto).trim()
-          : row.ingredientes != null
-            ? String(row.ingredientes).trim()
+        r.ingredientestexto != null
+          ? String(r.ingredientestexto).trim()
+          : r.ingredientes != null
+            ? String(r.ingredientes).trim()
             : descripcion;
 
       if (!descripcion && !ingredientesTexto) {
         omitidasSinTexto++;
+        console.warn(
+          `📋 cargarDescripciones — fila ${idx + 1} (${pk}) sin descripcion:`,
+          r
+        );
         return;
       }
 
@@ -446,28 +495,25 @@ async function cargarDescripciones() {
       };
     });
 
-    const n = Object.keys(map).length;
     console.log(
-      `📋 descripcionesMap: ${n} pizzas (${data.length} filas en hoja "descripciones")`
+      "📋 cargarDescripciones — resultado final mapa:",
+      JSON.stringify(map, null, 2)
     );
-    if (n > 0) {
-      console.log("📋 descripcionesMap muestra:", JSON.stringify(map, null, 2).slice(0, 1200));
-    }
-    if (n === 0 && data.length > 0) {
-      console.warn(
-        "⚠️ descripcionesMap vacío pero hay filas en Sheets — revisa columnas *pizza* y *descripcion*"
-      );
-    } else if (n === 0) {
-      console.warn(
-        "⚠️ descripcionesMap vacío — hoja descripciones sin datos o error al exportar CSV"
-      );
-    }
-    if (omitidasSinTexto > 0) {
-      console.warn(`⚠️ ${omitidasSinTexto} fila(s) sin descripcion/ingredientes`);
-    }
+    console.log(
+      `📋 cargarDescripciones — resumen: ${Object.keys(map).length} pizzas, ${data.length} filas, ${omitidasSinTexto} omitidas sin texto`
+    );
   } catch (err) {
-    console.warn("⚠️ cargarDescripciones error:", err?.message || err);
+    console.error("❌ cargarDescripciones — error al leer Google Sheets:", err?.message || err);
+    if (err?.response) {
+      console.error(
+        "❌ cargarDescripciones — respuesta HTTP:",
+        err.response.status,
+        String(err.response.data ?? "").slice(0, 500)
+      );
+    }
+    if (err?.stack) console.error(err.stack);
   }
+
   return map;
 }
 
