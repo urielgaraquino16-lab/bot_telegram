@@ -416,20 +416,57 @@ async function cargarDescripciones() {
   const map = {};
   try {
     const data = await obtenerFilasDeHojaGoogleSheets("descripciones");
+    let omitidasSinTexto = 0;
     data.forEach((row) => {
       const pk =
         row.pizza != null
           ? String(row.pizza).toLowerCase().trim()
           : "";
-      if (!pk || !menu[pk]) return;
+      if (!pk) return;
+
+      const descripcion =
+        row.descripcion != null
+          ? String(row.descripcion).trim()
+          : "";
+      const ingredientesTexto =
+        row.ingredientesTexto != null
+          ? String(row.ingredientesTexto).trim()
+          : row.ingredientes != null
+            ? String(row.ingredientes).trim()
+            : descripcion;
+
+      if (!descripcion && !ingredientesTexto) {
+        omitidasSinTexto++;
+        return;
+      }
+
       map[pk] = {
-        descripcion:
-          row.descripcion != null ? String(row.descripcion).trim() : "",
-        ingredientesTexto: ""
+        descripcion,
+        ingredientesTexto: ingredientesTexto || descripcion
       };
     });
-  } catch {
-    // vacío
+
+    const n = Object.keys(map).length;
+    console.log(
+      `📋 descripcionesMap: ${n} pizzas (${data.length} filas en hoja "descripciones")`
+    );
+    if (n > 0) {
+      console.log("📋 descripcionesMap muestra:", JSON.stringify(map, null, 2).slice(0, 1200));
+    }
+    if (n === 0 && data.length > 0) {
+      console.warn(
+        "⚠️ descripcionesMap vacío pero hay filas en Sheets — revisa columnas *pizza* y *descripcion*"
+      );
+    } else if (n === 0) {
+      console.warn(
+        "⚠️ descripcionesMap vacío — hoja descripciones sin datos o error al exportar CSV"
+      );
+    }
+    if (omitidasSinTexto > 0) {
+      console.warn(`⚠️ ${omitidasSinTexto} fila(s) sin descripcion/ingredientes`);
+    }
+  } catch (err) {
+    console.warn("⚠️ cargarDescripciones error:", err?.message || err);
   }
   return map;
 }
@@ -928,7 +965,25 @@ const GROQ_MANEJADO_SENTINEL = "__GROQ_MANEJADO__";
 async function responderConGroq(pregunta, contexto, timeoutMs = GROQ_TIMEOUT_MS) {
   if (!USE_GROQ || !groqClient) return "ESCALAR";
 
-  const ctx = contexto != null ? String(contexto) : construirContextoCatalogo();
+  const ctx =
+    contexto != null && String(contexto).trim()
+      ? String(contexto)
+      : construirContextoCatalogo();
+
+  const descKeys = Object.keys(descripcionesMap || {});
+  console.log("🤖 Groq — pregunta del cliente:", pregunta);
+  console.log(
+    "🤖 Groq — descripcionesMap:",
+    descKeys.length
+      ? descripcionesMap
+      : "(vacío — revisar hoja descripciones en Google Sheets)"
+  );
+  console.log(
+    "🤖 Groq — contexto enviado:",
+    ctx.length ? ctx : "(vacío)",
+    ctx.length > 800 ? `\n... [${ctx.length} caracteres total]` : ""
+  );
+
   const userContent = `Contexto del negocio:\n${ctx}\n\nPregunta del cliente:\n${pregunta}`;
 
   try {
@@ -3822,16 +3877,7 @@ if (estado.paso === "promo") {
 
 if (estado.intentos >= 2) {
   // Antes de derivar a un asesor humano, intentamos resolver con Groq.
-  const contexto = `
-MENÚ DE PIZZAS CARLY:
-${JSON.stringify(menu)}
-
-COMPLEMENTOS:
-${complementosItems.map(c => `${c.nombre}: $${c.precio}`).join('\n')}
-
-DESCRIPCIONES:
-${Object.entries(descripcionesMap).map(([k,v]) => `${k}: ${v.ingredientesTexto}`).join('\n')}
-`;
+  const contexto = construirContextoCatalogo();
 
   const r = await preguntarAGroqConIndicador(
     sock,
