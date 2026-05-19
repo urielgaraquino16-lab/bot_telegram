@@ -377,14 +377,22 @@ function sinAcentos(s) {
     .replace(/\p{M}/gu, "");
 }
 
-// Ignorar chats que no son clientes (historias, newsletters, etc.)
+// Ignorar chats que no son clientes (historias, newsletters, grupos, etc.)
 function esJidSistema(remoteJid) {
   if (!remoteJid || typeof remoteJid !== "string") return true;
   const j = remoteJid.toLowerCase();
+  if (j.endsWith("@g.us")) return true;
   if (j === "status@broadcast") return true;
   if (j.endsWith("@newsletter")) return true;
   if (j === "broadcast") return true;
   return false;
+}
+
+/** Solo procesar chats individuales, no grupos ni otros JIDs. */
+function esChatIndividual(remoteJid) {
+  if (!remoteJid || typeof remoteJid !== "string") return false;
+  const j = remoteJid.toLowerCase();
+  return j.endsWith("@s.whatsapp.net") || j.endsWith("@lid");
 }
 
 // Texto legible para Telegram / logs (+52..., grupo, etc.)
@@ -2678,6 +2686,8 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
   if (msg.key.fromMe) return;
 
   const from = msg.key.remoteJid;
+  // Solo chats 1:1; ignorar grupos (@g.us) y cualquier otro JID.
+  if (!esChatIndividual(from)) return;
   if (esJidSistema(from)) return;
 
   const quien = etiquetaCliente(msg);
