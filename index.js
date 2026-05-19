@@ -42,8 +42,14 @@ try {
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL_NAME = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
-const GROQ_SYSTEM_PROMPT =
-  "Eres un asistente amable de Pizzas Carly. Solo respondes preguntas sobre el menú, ingredientes, precios, promociones y políticas del negocio. Si no puedes responder con certeza, responde exactamente con la palabra: ESCALAR\nSé breve, máximo 3 líneas. No inventes precios.";
+
+const MODO_HUMANO_TTL_MS = 30 * 60 * 1000;
+const MENSAJE_FUERA_HORARIO =
+  "😊 Hola! Estamos cerrados por el momento.\nAbrimos todos los días a las 12:00 PM.\n¡Te esperamos mañana! 🍕";
+const MENSAJE_REACTIVACION_BOT =
+  "😊 Hola de nuevo, soy Carly.\n¿Te puedo ayudar con algo? 🍕";
+const TEXTO_CIERRE_PEDIDO_CARLY =
+  "¡Listo! 🎉 Tu pedido está en camino.\n⏱ Tiempo estimado: 30-40 minutos.\n¡Gracias por elegir Pizzas Carly! 🍕";
 
 const USE_GROQ = !!(GroqCtor && GROQ_API_KEY);
 const groqClient = USE_GROQ ? new GroqCtor({ apiKey: GROQ_API_KEY }) : null;
@@ -1011,19 +1017,11 @@ function aplicarEdicionCarritoNatural(estado, textoClean) {
 async function sendText(sock, to, estado, text) {
   const t = String(text || "").trim();
   if (!t) return;
-  // Evita repetir el mismo bloque largo en segundos seguidos.
-  const now = Date.now();
-  if (
-    estado &&
-    estado.lastBotMessageText === t &&
-    now - Number(estado.lastBotMessageAt || 0) < 2500
-  ) {
-    return;
-  }
+  if (estado && estado.lastBotMessageText === t) return;
   await sock.sendMessage(to, { text: t });
   if (estado) {
     estado.lastBotMessageText = t;
-    estado.lastBotMessageAt = now;
+    estado.lastBotMessageAt = Date.now();
   }
 }
 
@@ -1077,52 +1075,490 @@ function construirContextoCatalogo() {
     .join("\n");
 }
 
+function construirTextoMenuParaPrompt() {
+  const lines = [];
+  for (const [pizza, tamanos] of Object.entries(menu || {})) {
+    if (!tamanos || typeof tamanos !== "object") continue;
+    const partes = Object.entries(tamanos)
+      .map(([t, p]) => `${t}: $${p}`)
+      .join(", ");
+    lines.push(`- ${pizza}: ${partes}`);
+  }
+  return lines.join("\n") || "(sin datos)";
+}
+
+function construirTextoDescripcionesParaPrompt() {
+  const lines = [];
+  for (const [pizza, d] of Object.entries(descripcionesMap || {})) {
+    if (!d) continue;
+    const partes = [];
+    if (d.descripcion) partes.push(d.descripcion);
+    if (d.ingredientesTexto) partes.push(`ingredientes: ${d.ingredientesTexto}`);
+    if (partes.length) lines.push(`- ${pizza}: ${partes.join(" | ")}`);
+  }
+  return lines.join("\n") || "(sin datos)";
+}
+
+function construirTextoComplementosParaPrompt() {
+  return (complementosItems || [])
+    .map((c) => `- ${c.nombre}: $${c.precio}`)
+    .join("\n") || "(sin datos)";
+}
+
+function construirTextoPromosParaPrompt() {
+  const promos = obtenerPromosVigentes();
+  const general = String(restaurante?.promocionesTexto || "").trim();
+  if (!promos.length) {
+    if (general) return `(ninguna promo específica hoy)\nNota: ${general}`;
+    return "(hoy no hay promociones activas para este día)";
+  }
+  const lines = promos.map((p, i) => {
+    const titulo = p.titulo || p.nombre || p.id || `Promo ${i + 1}`;
+    const detalle = formatearTextoPromoCliente(p).replace(/\n+/g, " ").trim();
+    const notas = [];
+    if (p.incluyeRefresco === true) notas.push("incluye refresco");
+    if (p.incluyeRefresco === false) notas.push("no incluye refresco");
+    if (Array.isArray(p.tamanosAplica) && p.tamanosAplica.length) {
+      notas.push(`tamaños: ${p.tamanosAplica.join(", ")}`);
+    }
+    if (Array.isArray(p.saboresPermitidos) && p.saboresPermitidos.length) {
+      notas.push(`sabores: ${p.saboresPermitidos.join(", ")}`);
+    }
+    const meta = notas.length ? ` [${notas.join("; ")}]` : "";
+    return `- ${titulo}: ${detalle || "(ver detalle en sistema)"}${meta}`;
+  });
+  if (general) lines.push(`- General: ${general}`);
+  return lines.join("\n");
+}
+
+function etiquetaPasoPedido(paso) {
+  const map = {
+    A: "elegir pizza",
+    B: "elegir tamaño",
+    C: "extras (orilla de queso / masa delgada)",
+    D: "complementos",
+    E: "domicilio o recoger",
+    F: "dirección de entrega",
+    G: "confirmación del pedido",
+    H: "pedido confirmado"
+  };
+  return map[paso] || paso;
+}
+
+function serializarEstadoCliente(estado) {
+  const lines = [];
+  if (estado.modoHumano) {
+    lines.push("- Modo: asesor humano (bot en pausa)");
+  }
+  if (estado.pasoPedido) {
+    lines.push(`- Paso del pedido: ${estado.pasoPedido} (${etiquetaPasoPedido(estado.pasoPedido)})`);
+  }
+  if (estado.pizzaSugerida && !estado.ingredientes?.length) {
+    lines.push(`- Pizza no reconocida; sugerencia: ${estado.pizzaSugerida}`);
+  }
+  if (estado.ingredientes?.length) {
+    lines.push(`- Pizza: ${estado.ingredientes.join(" / ")}`);
+  }
+  if (estado.tamano) lines.push(`- Tamaño: ${estado.tamano}`);
+  if (estado.extrasLineas?.length) {
+    lines.push(`- Extras: ${estado.extrasLineas.join(", ")}`);
+  }
+  const { cb } = totalesComplementosYBebidas(estado);
+  if (cb.resumen) lines.push(`- Complementos/bebidas: ${cb.resumen}`);
+  if (estado.tipoServicio) lines.push(`- Servicio: ${estado.tipoServicio}`);
+  if (estado.dirCalle) lines.push(`- Calle y número: ${estado.dirCalle}`);
+  if (estado.dirEntre) lines.push(`- Entre calles: ${estado.dirEntre}`);
+  if (estado.dirReferencia) lines.push(`- Referencia: ${estado.dirReferencia}`);
+  if (estado.subPasoDireccion === "calle") {
+    lines.push("- Falta: calle y número");
+  } else if (estado.subPasoDireccion === "entre") {
+    lines.push("- Falta: entre qué calles");
+  } else if (estado.subPasoDireccion === "referencia") {
+    lines.push("- Falta: referencia o color de casa");
+  }
+  if (estado.pasoPedido === "G" || estado.pasoPedido === "H") {
+    const resumen = resumenDetalladoPedidoParaCliente(estado);
+    if (resumen) {
+      lines.push("- Resumen actual:");
+      lines.push(resumen);
+    }
+    const { total } = subtotalesPedidoActuales(estado);
+    if (total > 0) lines.push(`- Total calculado: $${total}`);
+  }
+  return lines.length ? lines.join("\n") : "- Cliente nuevo / conversación general";
+}
+
+function construirSystemPromptCarly(estado) {
+  return `Eres Carly, asistente amigable de Pizzas Carly 🍕
+Hablas de forma natural, cálida y paciente.
+Mensajes cortos, máximo 3 líneas.
+Usas emojis con moderación.
+
+MENÚ ACTUAL:
+${construirTextoMenuParaPrompt()}
+
+DESCRIPCIONES:
+${construirTextoDescripcionesParaPrompt()}
+
+COMPLEMENTOS:
+${construirTextoComplementosParaPrompt()}
+
+PROMOCIONES DE HOY (hora México; solo estas aplican hoy):
+${construirTextoPromosParaPrompt()}
+
+ESTADO ACTUAL DEL CLIENTE:
+${serializarEstadoCliente(estado)}
+
+REGLAS:
+- Si el cliente quiere hacer un pedido, guíalo paso a paso: primero pizza, luego tamaño, luego complementos, luego dirección.
+- Si preguntan ingredientes, responde directo.
+- Si preguntan precio, responde directo.
+- Si preguntan promociones, ofertas o combos del día, responde solo con PROMOCIONES DE HOY (no inventes otras).
+- Si no puedes ayudar, responde exactamente: ESCALAR
+- Nunca inventes precios ni ingredientes.
+- Nunca hagas más de una pregunta a la vez.
+- Si el cliente se confunde, simplifica y guíalo con opciones numeradas.
+- En paso B muestra tamaños con precios de la pizza elegida (1 mediana, 2 grande, etc.).
+- En paso D muestra complementos con precios del menú.
+- En paso G muestra resumen completo y pide confirmar con SÍ.`;
+}
+
+function sugerirPizzaSimilar(texto) {
+  const ings = detectarIngredientes(texto);
+  if (ings.length && menu[ings[0]]) return ings[0];
+  const t = sinAcentos(normalizarTextoPedido(texto));
+  const pizzas = Object.keys(menu || {});
+  for (const p of pizzas) {
+    const pn = sinAcentos(normalizarTextoPedido(p));
+    if (pn.includes(t) || t.includes(pn)) return p;
+  }
+  let best = null;
+  let bestLen = 0;
+  for (const p of pizzas) {
+    const pn = sinAcentos(normalizarTextoPedido(p));
+    const common = pn.split("").filter((c) => t.includes(c)).length;
+    if (common > bestLen) {
+      bestLen = common;
+      best = p;
+    }
+  }
+  return best;
+}
+
+function detectarInicioPedido(textoClean) {
+  return /(pedido|ordenar|quiero pizza|una pizza|hacer pedido|comprar pizza)/.test(
+    textoClean
+  );
+}
+
+function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
+  if (!textoClean) return;
+
+  if (!estado.pasoPedido && detectarInicioPedido(textoClean)) {
+    estado.pasoPedido = "A";
+  }
+
+  if (estado.pasoPedido === "A") {
+    const ings = detectarIngredientes(textoClean);
+    if (ings.length) {
+      const validos = ings.filter((i) => menu[i]);
+      if (validos.length) {
+        estado.ingredientes = validos.slice(0, 2);
+        estado.pizzaSugerida = null;
+        estado.pasoPedido = "B";
+      } else {
+        estado.pizzaSugerida = sugerirPizzaSimilar(textoClean);
+      }
+    }
+    return;
+  }
+
+  if (estado.pasoPedido === "B") {
+    const mapa = {
+      "1": "mediana",
+      "2": "grande",
+      "3": "familiar",
+      "4": "jumbo",
+      "5": "mega"
+    };
+    const tam = mapa[textoClean] || detectarTamano(textoClean);
+    const pizza = estado.ingredientes?.[0];
+    if (tam && pizza && menu[pizza]?.[tam]) {
+      estado.tamano = tam;
+      estado.pasoPedido = "C";
+    }
+    return;
+  }
+
+  if (estado.pasoPedido === "C") {
+    mergeExtrasEnEstado(estado, textoClean);
+    if (textoClean.length > 0) estado.pasoPedido = "D";
+    return;
+  }
+
+  if (estado.pasoPedido === "D") {
+    if (/(^no$|ninguno|sin complemento|nada mas|siguiente|listo|asi esta)/.test(textoClean)) {
+      estado.pasoPedido = "E";
+      return;
+    }
+    const pick = resolverItemCatalogoPorNumeroONombre(textoClean);
+    if (pick) {
+      if (!estado.complementos) estado.complementos = {};
+      estado.complementos[pick.nombre] = (estado.complementos[pick.nombre] || 0) + 1;
+      if (pick.tipo === "bebida") {
+        if (!Array.isArray(estado.lineasBebida)) estado.lineasBebida = [];
+        estado.lineasBebida.push({ nombre: pick.nombre, cantidad: 1 });
+      } else if (!Array.isArray(estado.lineasComplemento)) {
+        estado.lineasComplemento = [];
+      }
+      if (pick.tipo === "comp") {
+        estado.lineasComplemento.push({ nombre: pick.nombre, cantidad: 1 });
+      }
+    }
+    const directo = detectarPedidoDirecto(textoClean);
+    if (directo?.complementos) {
+      for (const [nombre, cant] of Object.entries(directo.complementos)) {
+        estado.complementos[nombre] = (estado.complementos[nombre] || 0) + (cant || 1);
+      }
+    }
+    return;
+  }
+
+  if (estado.pasoPedido === "E") {
+    if (/(domicilio|a domicilio|envio|envío|a casa|a mi casa)/.test(textoClean)) {
+      estado.tipoServicio = "domicilio";
+      estado.pasoPedido = "F";
+      estado.subPasoDireccion = "calle";
+    } else if (/(recoger|pickup|paso|tienda|local|recojo)/.test(textoClean)) {
+      estado.tipoServicio = "recoger";
+      estado.pasoPedido = "G";
+    }
+    return;
+  }
+
+  if (estado.pasoPedido === "F") {
+    const sub = estado.subPasoDireccion || "calle";
+    const t = String(texto || "").trim();
+    if (sub === "calle" && t.length >= 4) {
+      estado.dirCalle = t;
+      estado.subPasoDireccion = "entre";
+    } else if (sub === "entre" && t.length >= 3) {
+      estado.dirEntre = t;
+      estado.subPasoDireccion = "referencia";
+    } else if (sub === "referencia" && t.length >= 2) {
+      estado.dirReferencia = t;
+      estado.direccionCompleta = `${estado.dirCalle} | Entre ${estado.dirEntre} | Ref: ${estado.dirReferencia}`;
+      estado.subPasoDireccion = null;
+      estado.pasoPedido = "G";
+    }
+  }
+}
+
+function jidEsAdmin(jid) {
+  if (!NUMERO_ADMIN || !jid) return false;
+  const a = String(jid).split("@")[0].replace(/\D/g, "");
+  const b = String(NUMERO_ADMIN).split("@")[0].replace(/\D/g, "");
+  return a === b || a.endsWith(b) || b.endsWith(a);
+}
+
+function resolverJidClientePorNumero(numeroRaw) {
+  const digits = String(numeroRaw || "").replace(/\D/g, "");
+  if (!digits) return null;
+  for (const jid of Object.keys(estados)) {
+    const d = jid.split("@")[0].replace(/\D/g, "");
+    if (d === digits || d.endsWith(digits) || digits.endsWith(d)) return jid;
+  }
+  const prefijos = [digits, `52${digits}`, `521${digits}`];
+  for (const p of prefijos) {
+    const cand = `${p}@s.whatsapp.net`;
+    if (estados[cand]) return cand;
+  }
+  return `${digits}@s.whatsapp.net`;
+}
+
+async function manejarComandoAdmin(sock, from, texto) {
+  if (!jidEsAdmin(from)) return false;
+  const m = String(texto || "")
+    .trim()
+    .match(/^\/bot\s+(\d[\d\s]{6,14})/i);
+  if (!m) return false;
+  const jid = resolverJidClientePorNumero(m[1]);
+  if (!estados[jid]) estados[jid] = nuevoEstadoCliente();
+  estados[jid].modoHumano = false;
+  estados[jid].tiempoEscalado = 0;
+  await sock.sendMessage(from, {
+    text: `✅ Bot reactivado para *${m[1].trim()}*`
+  });
+  return true;
+}
+
+async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, textoClean, esNuevoCliente) {
+  if (estado.modoHumano) {
+    if (Date.now() - Number(estado.tiempoEscalado || 0) >= MODO_HUMANO_TTL_MS) {
+      estado.modoHumano = false;
+      estado.tiempoEscalado = 0;
+      await sendText(sock, from, estado, MENSAJE_REACTIVACION_BOT);
+    } else {
+      return;
+    }
+  }
+
+  if (!estaAbierto()) {
+    await sendText(sock, from, estado, MENSAJE_FUERA_HORARIO);
+    return;
+  }
+
+  await recargarArchivosSiCambioThrottled();
+
+  if (textoClean.includes("cancelar")) {
+    await registrarEventoMetricas("pedido_cancelado", { from, paso: estado.pasoPedido || "?" });
+    resetEstadoCliente(from, estado);
+    await sendText(
+      sock,
+      from,
+      estado,
+      "❌ Pedido cancelado.\n\n👋 Cuando quieras, escríbeme de nuevo 🍕"
+    );
+    return;
+  }
+
+  if (esNuevoCliente && !estado.notificadoInicio && textoClean) {
+    estado.notificadoInicio = true;
+    await registrarEventoMetricas("nuevo_cliente", { from, quien });
+    await notificarUrgenteMovil(sock, {
+      waTitulo: "NUEVO CLIENTE",
+      waDetalle: `📞 ${quien}\nJID: ${from}\n💬 "${textoClean}"`,
+      tgTexto: `🚨 NUEVO CLIENTE\n📞 ${quien}\nJID: ${from}\n💬 "${textoClean}"`
+    });
+  }
+
+  if (msg.message?.locationMessage) {
+    const lat = msg.message.locationMessage.degreesLatitude;
+    const lng = msg.message.locationMessage.degreesLongitude;
+    if (estado.pasoPedido === "F" || estado.tipoServicio === "domicilio") {
+      estado.direccionCompleta = `Ubicación: https://maps.google.com/?q=${lat},${lng}`;
+      estado.pasoPedido = "G";
+      estado.subPasoDireccion = null;
+    } else {
+      await sendText(
+        sock,
+        from,
+        estado,
+        "📍 Recibí tu ubicación. Cuando hagas pedido a domicilio, la usamos 👍"
+      );
+      return;
+    }
+  }
+
+  actualizarEstadoDesdeMensaje(estado, texto, textoClean);
+
+  if (estado.pasoPedido === "G" && esAfirmacionSimple(textoClean)) {
+    await cerrarPedidoCarly(sock, from, estado, quien);
+    return;
+  }
+
+  if (!USE_GROQ) {
+    await activarModoHumano(sock, from, estado, quien, "Groq no configurado");
+    return;
+  }
+
+  const respuesta = await responderConGroqCarly(estado, textoClean || texto);
+
+  if (respuesta === GROQ_TIMEOUT_SENTINEL || !respuesta || /^ESCALAR\b/i.test(respuesta)) {
+    await activarModoHumano(sock, from, estado, quien, textoClean || texto);
+    return;
+  }
+
+  await sendText(sock, from, estado, respuesta);
+}
+
+async function activarModoHumano(sock, from, estado, quien, motivo = "") {
+  estado.modoHumano = true;
+  estado.tiempoEscalado = Date.now();
+  const detalle = String(motivo || "").trim();
+  await notificarUrgenteMovil(sock, {
+    waTitulo: "ESCALAR A ASESOR",
+    waDetalle: `📞 ${quien}\nJID: ${from}${detalle ? `\n💬 ${detalle}` : ""}`,
+    tgTexto: `🚨 *Cliente necesita asesor*\n📞 ${quien}\nJID: ${from}${detalle ? `\n💬 ${detalle}` : ""}`
+  });
+  await registrarEventoMetricas("escalado_humano", { from, motivo: detalle || "ESCALAR" });
+}
+
+async function cerrarPedidoCarly(sock, from, estado, quien) {
+  const resumen = resumenDetalladoPedidoParaCliente(estado);
+  const { total } = subtotalesPedidoActuales(estado);
+  const dir =
+    estado.tipoServicio === "domicilio"
+      ? estado.direccionCompleta || [estado.dirCalle, estado.dirEntre, estado.dirReferencia].filter(Boolean).join(" | ")
+      : "Recoger en tienda";
+
+  const payload = `🍕 *PEDIDO CONFIRMADO (Carly)*\n\n📞 ${quien}\nJID: ${from}\n📍 ${dir}\n\n${resumen || "—"}\n💰 Total: $${total}`;
+
+  await notificarUrgenteMovil(sock, {
+    waTitulo: "PEDIDO CONFIRMADO",
+    waDetalle: payload,
+    tgTexto: payload
+  });
+
+  try {
+    const telefono = String(from || "").replace(/@.+$/, "");
+    await guardarPedido({
+      cliente: quien || "Cliente",
+      telefono,
+      pedido: `${resumen || lineaPizzaEmoji(estado) || "Pedido"} | ${dir}`,
+      total: Number(total || 0)
+    });
+    const pedidoGuardar = `
+------------------------
+Cliente: ${from}
+Pedido: ${resumen}
+Dirección: ${dir}
+Total: $${total}
+Fecha: ${new Date().toLocaleString()}
+`;
+    await registrarPedidoEnStorage(pedidoGuardar);
+    ultimoPedidoPorCliente[from] = snapshotPedido(estado);
+  } catch (err) {
+    console.error("❌ cerrarPedidoCarly:", err?.message || err);
+  }
+
+  estado.pasoPedido = "H";
+  await sendText(sock, from, estado, TEXTO_CIERRE_PEDIDO_CARLY);
+  resetEstadoCliente(from, estado);
+}
+
 const GROQ_TIMEOUT_MS = 15000;
 const GROQ_INDICADOR_DELAY_MS = 2000;
 const GROQ_TIMEOUT_SENTINEL = "__TIMEOUT__";
 const GROQ_MANEJADO_SENTINEL = "__GROQ_MANEJADO__";
 
-async function responderConGroq(pregunta, contexto, timeoutMs = GROQ_TIMEOUT_MS) {
+async function responderConGroqCarly(estado, pregunta, timeoutMs = GROQ_TIMEOUT_MS) {
   if (!USE_GROQ || !groqClient) return "ESCALAR";
 
-  const ctx =
-    contexto != null && String(contexto).trim()
-      ? String(contexto)
-      : construirContextoCatalogo();
+  const system = construirSystemPromptCarly(estado);
+  if (!Array.isArray(estado.historialGroq)) estado.historialGroq = [];
+  const historial = estado.historialGroq.slice(-8);
 
-  const descKeys = Object.keys(descripcionesMap || {});
-  console.log("🤖 Groq — pregunta del cliente:", pregunta);
-  console.log(
-    "🤖 Groq — descripcionesMap:",
-    descKeys.length
-      ? descripcionesMap
-      : "(vacío — revisar hoja descripciones en Google Sheets)"
-  );
-  console.log(
-    "🤖 Groq — contexto enviado:",
-    ctx.length ? ctx : "(vacío)",
-    ctx.length > 800 ? `\n... [${ctx.length} caracteres total]` : ""
-  );
+  const messages = [{ role: "system", content: system }];
+  for (const turn of historial) {
+    messages.push(turn);
+  }
+  messages.push({ role: "user", content: String(pregunta || "").trim() || "hola" });
 
-  const userContent = `Contexto del negocio:\n${ctx}\n\nPregunta del cliente:\n${pregunta}`;
+  console.log("🤖 Carly — cliente:", pregunta);
+  console.log("🤖 Carly — paso:", estado.pasoPedido || "—");
 
   try {
     let timeoutHandle;
     const timeoutPromise = new Promise((resolve) => {
-      timeoutHandle = setTimeout(
-        () => resolve(GROQ_TIMEOUT_SENTINEL),
-        timeoutMs
-      );
+      timeoutHandle = setTimeout(() => resolve(GROQ_TIMEOUT_SENTINEL), timeoutMs);
     });
     const apiPromise = (async () => {
       const completion = await groqClient.chat.completions.create({
         model: GROQ_MODEL_NAME,
-        messages: [
-          { role: "system", content: GROQ_SYSTEM_PROMPT },
-          { role: "user", content: userContent }
-        ],
-        temperature: 0.4,
-        max_tokens: 256
+        messages,
+        temperature: 0.5,
+        max_tokens: 280
       });
       const text = String(completion?.choices?.[0]?.message?.content || "").trim();
       return text || "ESCALAR";
@@ -1131,12 +1567,30 @@ async function responderConGroq(pregunta, contexto, timeoutMs = GROQ_TIMEOUT_MS)
     clearTimeout(timeoutHandle);
     if (respuesta === GROQ_TIMEOUT_SENTINEL) {
       console.warn(`⚠️ Groq timeout (>${timeoutMs}ms)`);
+      return "ESCALAR";
+    }
+    estado.historialGroq.push({ role: "user", content: String(pregunta || "").trim() });
+    estado.historialGroq.push({ role: "assistant", content: respuesta });
+    if (estado.historialGroq.length > 16) {
+      estado.historialGroq = estado.historialGroq.slice(-16);
     }
     return respuesta;
   } catch (err) {
     console.error("❌ Groq error:", err?.message || err);
     return "ESCALAR";
   }
+}
+
+async function responderConGroq(pregunta, contexto, timeoutMs = GROQ_TIMEOUT_MS) {
+  const stub = { historialGroq: [] };
+  if (contexto) {
+    return responderConGroqCarly(
+      { ...stub, pasoPedido: null },
+      `Contexto:\n${contexto}\n\nPregunta: ${pregunta}`,
+      timeoutMs
+    );
+  }
+  return responderConGroqCarly(stub, pregunta, timeoutMs);
 }
 
 // Indicador "consultando" diferido + timeout + escalamiento (misma logica que antes).
@@ -1334,6 +1788,7 @@ const SESSION_INACTIVITY_MS = 15 * 60 * 1000;
 function nuevoEstadoCliente() {
   return {
     paso: "inicio",
+    pasoPedido: null,
     ingredientes: [],
     complementos: {},
     avisoCierre: false,
@@ -1361,7 +1816,18 @@ function nuevoEstadoCliente() {
     marketingHintsShown: {},
     promoOpcionesIds: [],
     saludoInicialEnviado: false,
-    esperandoHumanoHasta: 0
+    esperandoHumanoHasta: 0,
+    procesando: false,
+    modoHumano: false,
+    tiempoEscalado: 0,
+    historialGroq: [],
+    tipoServicio: null,
+    dirCalle: null,
+    dirEntre: null,
+    dirReferencia: null,
+    direccionCompleta: null,
+    subPasoDireccion: null,
+    pizzaSugerida: null
   };
 }
 
@@ -1613,14 +2079,78 @@ function parseHorarioHHMM(s) {
   return h * 60 + min;
 }
 
+function zonaHorariaNegocio() {
+  return restaurante?.horarioAbierto?.zona || "America/Mexico_City";
+}
+
+function partesFechaEnZonaHoraria(zona) {
+  const tz = zona || zonaHorariaNegocio();
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      weekday: "long"
+    }).formatToParts(new Date());
+  } catch {
+    return null;
+  }
+}
+
+function diaSemanaEnZonaHoraria(zona) {
+  const parts = partesFechaEnZonaHoraria(zona);
+  const nombre = parts?.find((p) => p.type === "weekday")?.value?.toLowerCase();
+  const map = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6
+  };
+  if (nombre && map[nombre] != null) return map[nombre];
+  return new Date().getDay();
+}
+
+function diaLocalYyyyMmDdEnZonaHoraria(zona) {
+  const parts = partesFechaEnZonaHoraria(zona);
+  if (parts) {
+    const y = parts.find((p) => p.type === "year")?.value;
+    const m = parts.find((p) => p.type === "month")?.value;
+    const d = parts.find((p) => p.type === "day")?.value;
+    if (y && m && d) return `${y}-${m}-${d}`;
+  }
+  return diaLocalYyyyMmDd();
+}
+
+function minutosEnZonaHoraria(zona) {
+  const tz = zona || zonaHorariaNegocio();
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(new Date());
+    const h = Number(parts.find((p) => p.type === "hour")?.value || 0);
+    const m = Number(parts.find((p) => p.type === "minute")?.value || 0);
+    return h * 60 + m;
+  } catch {
+    const now = new Date();
+    return now.getHours() * 60 + now.getMinutes();
+  }
+}
+
 function estaAbierto() {
   const r = restaurante?.horarioAbierto;
-  if (!r || !r.inicio || !r.fin) return true;
-  const a = parseHorarioHHMM(r.inicio);
-  const b = parseHorarioHHMM(r.fin);
+  const inicio = r?.inicio || "12:00";
+  const fin = r?.fin || "22:30";
+  const a = parseHorarioHHMM(inicio);
+  const b = parseHorarioHHMM(fin);
   if (a == null || b == null) return true;
-  const now = new Date();
-  const cur = now.getHours() * 60 + now.getMinutes();
+  const cur = minutosEnZonaHoraria(r?.zona);
   if (b < a) return cur >= a || cur < b;
   return cur >= a && cur < b;
 }
@@ -2037,21 +2567,22 @@ function diaLocalYyyyMmDd(d = new Date()) {
   return `${y}-${mo}-${da}`;
 }
 
-function promoFechaVigente(p) {
+function promoFechaVigente(p, hoyStr) {
   const v = p?.vigencia;
   if (!v) return true;
-  const hoyStr = diaLocalYyyyMmDd();
-  if (v.desde && hoyStr < String(v.desde).trim()) return false;
-  if (v.hasta && hoyStr > String(v.hasta).trim()) return false;
+  const hoy = hoyStr || diaLocalYyyyMmDdEnZonaHoraria();
+  if (v.desde && hoy < String(v.desde).trim()) return false;
+  if (v.hasta && hoy > String(v.hasta).trim()) return false;
   return true;
 }
 
-function obtenerPromosVigentes(fecha = new Date()) {
+function obtenerPromosVigentes() {
   const list = restaurante.promociones;
   if (!Array.isArray(list) || !list.length) return [];
-  const dow = fecha.getDay();
+  const dow = diaSemanaEnZonaHoraria();
+  const hoyStr = diaLocalYyyyMmDdEnZonaHoraria();
   return list.filter((p) => {
-    if (!p || !promoFechaVigente(p)) return false;
+    if (!p || !promoFechaVigente(p, hoyStr)) return false;
     const dias = p.diasSemana;
     if (!Array.isArray(dias) || dias.length === 0) return true;
     return dias.includes(dow);
@@ -2707,1329 +3238,36 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
   const estado = estados[from];
   estado.ultimaActividadAt = Date.now();
 
-  // 📩 TEXTO PRIMERO
-const texto =
-  msg.message?.conversation ||
-  msg.message?.extendedTextMessage?.text ||
-  "";
+  const texto =
+    msg.message?.conversation ||
+    msg.message?.extendedTextMessage?.text ||
+    "";
 
-const textoLower = texto.toLowerCase();
-const textoClean = sinAcentos(textoLower.trim());
+  const textoLower = texto.toLowerCase();
+  const textoClean = sinAcentos(textoLower.trim());
 
-console.log("📩", textoClean);
-estado.lastUserMessageAt = Date.now();
+  console.log("📩", from, textoClean);
+  estado.lastUserMessageAt = Date.now();
 
-// 🍕 Pregunta de ingredientes/descripción → Groq (antes del flujo de pedido; no pide tamaño).
-if (
-  textoClean &&
-  puedeResponderConsultaDescripcion(estado.paso) &&
-  (await manejarConsultaDescripcionPizza(sock, from, quien, textoClean))
-) {
-  if (estado.paso === "inicio") estado.saludoInicialEnviado = true;
-  return;
-}
+  if (await manejarComandoAdmin(sock, from, texto)) return;
 
-// 🤖 Saludo inicial (solo primera vez) - sin importar qué escriba el cliente.
-if (esNuevoCliente && !estado.saludoInicialEnviado && textoClean) {
-  estado.saludoInicialEnviado = true;
-  const eco = (texto || "").trim().slice(0, 220);
-  await sendText(
-    sock,
-    from,
-    estado,
-    `🤖 Soy un bot de Pizzas Carly.\n\nVi tu mensaje: "${eco}".\n\nEscríbeme: *menú*, *promos*, *pedido* o lo que quieras hacer.`
-  );
-}
-
-// ⏸ Pausa: cuando el bot ya derivó al humano, ignoramos mensajes del chat
-// hasta que el asesor responda (por TTL).
-if (estado.paso === "esperando_humano" && estado.esperandoHumanoHasta) {
-  if (Date.now() < estado.esperandoHumanoHasta) {
-    if (textoClean.includes("cancelar")) {
-      resetEstadoCliente(from, estado);
-      await sendText(
-        sock,
-        from,
-        estado,
-        "❌ Pedido cancelado. Escribe *hola* o *menu* para comenzar de nuevo."
-      );
-    }
-    return;
-  }
-  // expiró la pausa
-  resetEstadoCliente(from, estado);
-}
-
-// 🔄 Si editaste archivos de catálogo/config, recarga sin reiniciar
-await recargarArchivosSiCambioThrottled();
-
-if (textoPideVolverMenu(textoClean)) {
-  estado.paso = "menu";
-  estado.intentos = 0;
-  await sendText(sock, from, estado, textoMenuPrincipal());
-  return;
-}
-
-if (textoPideAyudaBot(textoClean)) {
-  const ayudaPorPaso = {
-    menu: "🧭 Elige una opción: menú, promos, pedido, complementos o asesor.",
-    pedido: "🍕 Escribe sabor y si puedes tamaño. Ej: *hawaiana grande*.",
-    tamano: "📏 Responde con 1-5 o escribe: mediana, grande, familiar, jumbo, mega.",
-    solo_complementos: "🍟 Escribe el número o nombre del artículo (ej. alitas, coca).",
-    cantidad_complemento: "🔢 Aquí solo necesito la *cantidad* (ej. 1, 2, 3).",
-    direccion: "Escribe *confirmar* para pasarte con asesor y cerrar tu pedido."
-  };
-  const h = ayudaPorPaso[estado.paso] || "Escribe *menu* para volver al inicio, *carrito* para ver total o *asesor* para ayuda humana.";
-  await sendText(sock, from, estado, `🤝 ${h}`);
-  return;
-}
-
-if (textoPideReporte(textoClean)) {
-  const rep = await construirReporteMetricasHoy();
-  await sendText(sock, from, estado, rep);
-  return;
-}
-
-// 🚨 ALERTA URGENTE A TELEGRAM: primer mensaje del cliente
-if (esNuevoCliente && !estado.notificadoInicio && textoClean) {
-  estado.notificadoInicio = true;
-  await registrarEventoMetricas("nuevo_cliente", { from, quien });
-  await notificarUrgenteMovil(sock, {
-    waTitulo: "NUEVO CLIENTE",
-    waDetalle: `📞 ${quien}\nJID: ${from}\n💬 "${textoClean}"`,
-    tgTexto: `🚨 NUEVO CLIENTE\n📞 ${quien}\nJID: ${from}\n💬 "${textoClean}"`
-  });
-}
-
-
-// ❌ CANCELAR PEDIDO
-if (textoClean.includes("cancelar")) {
-  await registrarEventoMetricas("pedido_cancelado", { from, paso: estado.paso || "?" });
-  resetEstadoCliente(from, estado);
-
-  await sendText(sock, from, estado, `❌ Pedido cancelado
-
-👋 Puedes escribir *hola* para comenzar de nuevo`
-  );
-
-  return;
-}
-
-// 🛒 Mostrar resumen/total en cualquier momento sin romper el flujo.
-if (textoPideVerCarrito(textoClean)) {
-  const rdCarrito = resumenDetalladoPedidoParaCliente(estado);
-  if (rdCarrito) {
-    await sendText(
+  if (estado.procesando) return;
+  estado.procesando = true;
+  try {
+    await procesarConversacionCarly(
       sock,
+      msg,
       from,
+      quien,
       estado,
-      `🧾 *Así va tu pedido*\n\n${rdCarrito}\n\nSi quieres, agrega algo más o escribe *confirmar* para pasarte con asesor.`
+      texto,
+      textoClean,
+      esNuevoCliente
     );
-    return;
-  }
-}
-
-if (textoPidePedidoRapido(textoClean)) {
-  await registrarEventoMetricas("atajo_pedido_rapido", { from });
-  estado.paso = "pedido";
-  await sendText(
-    sock,
-    from,
-    estado,
-    "⚡ *Pedido rápido*\n\nEscríbeme todo en una sola línea: *sabor + tamaño + extras/complementos*.\nEj: *hawaiana grande con papas y coca*"
-  );
-  return;
-}
-
-if (textoPideRepetirUltimo(textoClean)) {
-  const prev = ultimoPedidoPorCliente[from];
-  if (!prev) {
-    await registrarEventoMetricas("atajo_repetir_ultimo_sin_historial", { from });
-    await sendText(sock, from, estado, "Aún no tengo un pedido previo tuyo para repetir.");
-    return;
-  }
-  await registrarEventoMetricas("atajo_repetir_ultimo_ok", { from });
-  estado.ingredientes = [...(prev.ingredientes || [])];
-  estado.tamano = prev.tamano || null;
-  estado.complementos = { ...(prev.complementos || {}) };
-  estado.lineasComplemento = Array.isArray(prev.lineasComplemento)
-    ? prev.lineasComplemento.map((x) => ({ ...x }))
-    : [];
-  estado.lineasBebida = Array.isArray(prev.lineasBebida)
-    ? prev.lineasBebida.map((x) => ({ ...x }))
-    : [];
-  estado.extrasActivos = { ...(prev.extrasActivos || {}) };
-  estado.extrasTotal = Number(prev.extrasTotal || 0);
-  estado.extrasLineas = [...(prev.extrasLineas || [])];
-  estado.paso = "confirmar";
-
-  const rdRepeat = resumenDetalladoPedidoParaCliente(estado);
-  await sendText(
-    sock,
-    from,
-    estado,
-    `🔁 *¡Listo! Repetí tu último pedido*\n\n${rdRepeat}\n\nEscribe *confirmar* y te paso con asesor para cerrarlo.`
-  );
-  return;
-}
-
-if (textoPideFinalizar(textoClean) && hayContenidoCarrito(estado)) {
-  if (estado.paso !== "confirmar") {
-    await registrarEventoMetricas("atajo_finalizar", { from, paso: estado.paso || "?" });
-    estado.paso = "confirmar";
-    const rdFin = resumenDetalladoPedidoParaCliente(estado);
-    await sendText(
-      sock,
-      from,
-      estado,
-      `✅ *Va, ya casi terminamos*\n\n${rdFin}\n\nEscribe *confirmar* y te paso con asesor para terminar.`
-    );
-    return;
-  }
-}
-
-// 📣 Marketing asistido (sin spam)
-if (textoPidePromos(textoClean)) {
-  await registrarEventoMetricas("consulta_promos", { from });
-  estado.marketingHintsShown = estado.marketingHintsShown || {};
-  const promos = obtenerPromosVigentes();
-  estado.marketingHintsShown.promos = true;
-  if (promos.length) {
-    const top = promos
-      .slice(0, 2)
-      .map((p) => `• *${p.titulo || "Promo"}* — ${formatearTextoPromoCliente(p).replace(/\n+/g, " ").trim()}`)
-      .join("\n");
-    await sendText(
-      sock,
-      from,
-      estado,
-      `🔥 *Promos de hoy*\n${top}\n\nSi te late una, escribe: *quiero esa promo*.`
-    );
-  } else {
-    await sendText(
-      sock,
-      from,
-      estado,
-      `🔥 Hoy conviene revisar combos del día.\nSi quieres, te ayudo a armar pedido rápido: sabor + tamaño + extras.`
-    );
+  } finally {
+    estado.procesando = false;
   }
   return;
-}
-
-if (textoPideRecomendacion(textoClean)) {
-  await registrarEventoMetricas("consulta_recomendacion", { from });
-  estado.marketingHintsShown = estado.marketingHintsShown || {};
-  if (!estado.marketingHintsShown.recomendacion) {
-    estado.marketingHintsShown.recomendacion = true;
-    const tienePizza = Array.isArray(estado.ingredientes) && estado.ingredientes.length > 0;
-    const hayComp = Number(totalesComplementosYBebidas(estado).total || 0) > 0;
-    const suger = tienePizza && !hayComp
-      ? "Te recomiendo *pizza + papas + bebida* para cerrar completo."
-      : "Te recomiendo una *pizza grande* y agregar *papas* o *alitas*.";
-    await sendText(
-      sock,
-      from,
-      estado,
-      `💡 ${suger}\n\nSi quieres, te lo armo aquí mismo: escribe sabor y tamaño (ej. *hawaiana grande*).`
-    );
-  } else {
-    await sendText(sock, from, estado, "Si gustas, te ayudo a cerrar tu pedido con sabor, tamaño y extras.");
-  }
-  return;
-}
-
-// ✏️ Editar carrito con lenguaje natural (quitar/cambiar tamaño/duplicar)
-{
-  const edicionMsg = aplicarEdicionCarritoNatural(estado, textoClean);
-  if (edicionMsg) {
-    const rdPostEdit = resumenDetalladoPedidoParaCliente(estado);
-    await sendText(
-      sock,
-      from,
-      estado,
-      rdPostEdit
-        ? `${edicionMsg}\n\n🧾 *Así va tu pedido:*\n${rdPostEdit}`
-        : edicionMsg
-    );
-    return;
-  }
-}
-
-// 🍕 Completar sabores para mitad y mitad (solo pregunta)
-if (estado.paso === "esperando_dos_sabores_mitad") {
-  const ings = detectarIngredientes(textoClean);
-  const tamD = detectarTamano(textoClean);
-  if (tamD) estado.tamano = tamD;
-
-  if (ings.length >= 2) {
-    estado.ingredientes = ings.slice(0, 2);
-    if (!estado.tamano) {
-      estado.paso = "tamano";
-      await sock.sendMessage(from, {
-        text: TEXTO_MENU_TAMANOS
-      });
-      return;
-    }
-    const precio = calcularPrecio(estado.ingredientes, estado.tamano);
-    const ex = detectarExtrasEnTexto(textoClean, estado.tamano);
-    await sock.sendMessage(from, {
-      text: `🍕 Mitad *${estado.ingredientes[0]}* y mitad *${estado.ingredientes[1]}*
-📏 ${estado.tamano}
-💲 *$${precio + ex.total}*${ex.total ? `\nExtras: ${ex.lineas.join(", ")}` : ""}
-
-_${restaurante.mitadMitad?.notaPrecio || ""}_
-
-👉 ¿Confirmas? Escribe *confirmar* y te paso con asesor para cerrar.`
-    });
-    estado.paso = "inicio";
-    return;
-  }
-
-  await sock.sendMessage(from, {
-    text: "🍕 Necesito *2 sabores* claros (ej. *hawaiana y peperoni*) y el *tamaño* si aún no lo dijiste."
-  });
-  return;
-}
-
-if (
-  estado.paso !== "elegir_salsa_complemento" &&
-  estado.paso !== "clarificar_salsa_mitad_o_dos" &&
-  (requiereHumPorAlitasComplejas(textoClean) || requiereHumPorTriggers(textoClean))
-) {
-  await sock.sendMessage(from, {
-    text: "👨‍💼 Para eso te enlazo con un asesor (salsas mixtas, naturales, etc.). En un momento te atienden."
-  });
-  await notificarUrgenteMovil(sock, {
-    waTitulo: "ASESOR REQUERIDO",
-    waDetalle: `Asesor (alitas/trigger)\n📞 ${quien}\nJID: ${from}\n💬 ${textoClean}`,
-    tgTexto: `🚨 *URGENTE — Asesor (alitas / trigger)*\n📞 ${quien}\nJID: ${from}\n💬 ${textoClean}`
-  });
-  return;
-}
-
-if (await procesarConsultasPorComas(sock, from, textoClean, quien)) return;
-
-if (esConsultaMitadMitadSoloPregunta(textoClean)) {
-  estado.paso = "esperando_dos_sabores_mitad";
-  await sock.sendMessage(from, {
-    text: `🍕 Sí: mitad y mitad se puede.\n_${restaurante.mitadMitad?.notaPrecio || ""}_\n\nDime los *2 sabores* (y el *tamaño*, ej. grande).`
-  });
-  return;
-}
-
-{
-  const rPrecio = resolverConsultaPrecio(textoClean);
-  const rFaq = buscarRespuestaFaq(textoClean);
-  const rDesc = await responderDescripcionPizza(textoClean, sock, from, quien);
-  if (rDesc === GROQ_MANEJADO_SENTINEL) return;
-  const preguntaCombo =
-    (/(combo|paquete)/.test(textoClean) && (estado.paso === "inicio" || estado.paso === "menu"));
-  if (preguntaCombo) {
-    const combosHoy = obtenerCombosVigentesHoy();
-    if (combosHoy.length) {
-      // Detecta si el cliente ya pide uno en específico (ej. "combo 2" o "combo de alitas")
-      const sel = detectarComboSeleccion(textoClean, combosHoy);
-      estado.paso = "promo";
-      estado.promoOpcionesIds = combosHoy.map((p) => p.id);
-
-      const generalUrl = String(restaurante?.combosImagenGeneralUrl || "").trim();
-
-      if (sel?.combo) {
-        estado.promoActivaId = sel.combo.id;
-        const cap = `✅ ${sel.combo.titulo || "Combo"}\n\n${formatearTextoPromoCliente(sel.combo)}\n\nSi te late, escribe *quiero la promo*.`;
-        if (sel.combo.imagenUrl && String(sel.combo.imagenUrl).trim()) {
-          await sock.sendMessage(from, {
-            image: { url: String(sel.combo.imagenUrl).trim() },
-            caption: cap
-          });
-        } else {
-          await sock.sendMessage(from, { text: cap });
-        }
-        return;
-      }
-
-      // Si no especificó cuál: manda imagen general + lista de opciones disponibles hoy.
-      estado.promoActivaId = combosHoy[0]?.id || null;
-      const textoOps = combosHoy
-        .map((p, idx) => `${idx + 1}️⃣ ${p.titulo || "Combo"}`)
-        .join("\n");
-      const capGeneral = `🔥 Sí, hoy tenemos combos:\n\n${textoOps}\n\n👉 Elige número (1, 2, 3...) o escribe *quiero la promo*.`;
-
-      if (generalUrl) {
-        await sock.sendMessage(from, { image: { url: generalUrl }, caption: capGeneral });
-      } else {
-        await sock.sendMessage(from, { text: capGeneral });
-      }
-      return;
-    }
-  }
-  const rHs = esPreguntaHorarioServicioPromoCombo(textoClean)
-    ? responderServicioHorarioPromoCombo(textoClean)
-    : null;
-  if (rPrecio || rFaq || rDesc || rHs) {
-    await sock.sendMessage(from, {
-      text: [rPrecio, rFaq, rDesc, rHs].filter(Boolean).join("\n\n")
-    });
-    return;
-  }
-}
-
-// 🧠 PEDIDO DIRECTO EN UN SOLO MENSAJE (pizza + complementos + dirección)
-// Ej: "quiero 2 papas a la francesa y una pizza grande de peperoni a la calle 18..."
-if (
-  ![
-    "cantidad_complemento",
-    "agregar_mas",
-    "confirmar",
-    "confirmar_complementos",
-    "elegir_salsa_complemento",
-    "clarificar_salsa_mitad_o_dos"
-  ].includes(estado.paso)
-) {
-  const pedidoDirecto = detectarPedidoDirecto(textoClean);
-  if (pedidoDirecto) {
-    // ambigüedad de papas
-    if (pedidoDirecto.ambiguedades?.length) {
-      const amb = pedidoDirecto.ambiguedades[0];
-      estado.paso = "resolver_ambiguedad_complemento";
-      estado.ambOpciones = amb.opciones;
-      estado.ambCantidad = amb.cantidad || 1;
-
-      const lista = amb.opciones
-        .map((n, idx) => `${idx + 1}️⃣ ${capitalizar(n)}`)
-        .join("\n");
-
-      await sock.sendMessage(from, {
-        text: `🍟 ¿Cuáles papas quieres?\n\n${lista}\n\n👉 Escribe el número`
-      });
-      return;
-    }
-
-    // merge de complementos detectados
-    if (!estado.complementos) estado.complementos = {};
-    for (const [nombre, cant] of Object.entries(pedidoDirecto.complementos || {})) {
-      estado.complementos[nombre] = (estado.complementos[nombre] || 0) + (cant || 1);
-    }
-
-    if (pedidoDirecto.bebidas && Object.keys(pedidoDirecto.bebidas).length > 0) {
-      if (!Array.isArray(estado.lineasBebida)) estado.lineasBebida = [];
-      for (const [nombre, cant] of Object.entries(pedidoDirecto.bebidas)) {
-        estado.lineasBebida.push({ nombre, cantidad: cant || 1 });
-      }
-    }
-
-    // merge de pizza detectada
-    if (pedidoDirecto.ingredientes?.length) estado.ingredientes = pedidoDirecto.ingredientes;
-    if (pedidoDirecto.tamano) estado.tamano = pedidoDirecto.tamano;
-
-    const salsaPend = extraerPrimeroComplementoQueRequiereSalsa(estado);
-    if (salsaPend) {
-      if (pedidoDirecto.direccion) {
-        estado.direccionPendienteTexto = String(pedidoDirecto.direccion).trim();
-      }
-      estado.tempComplemento = salsaPend.nombre;
-      estado.tempCantidadPre = salsaPend.cantidad;
-      estado.paso = "elegir_salsa_complemento";
-      await sock.sendMessage(from, {
-        text: textoMenuSalsasAlitas()
-      });
-      return;
-    }
-
-    const faltaIngrediente = !estado.ingredientes || estado.ingredientes.length === 0;
-    const faltaTamano = !estado.tamano;
-
-    // si pidió pizza pero le falta algo, pregunta lo que falta
-    const mencionoPizza = pedidoDirecto.ingredientes.length > 0 || Boolean(pedidoDirecto.tamano) || /pizza\b/.test(textoClean);
-    if (mencionoPizza && (faltaIngrediente || faltaTamano)) {
-      if (faltaIngrediente) {
-        estado.paso = "pedido";
-        await sock.sendMessage(from, { text: "🍕 ¿De qué sabor la pizza? (peperoni, hawaiana, etc)" });
-        return;
-      }
-      if (faltaTamano) {
-        estado.paso = "tamano";
-        await sock.sendMessage(from, {
-          text: TEXTO_MENU_TAMANOS
-        });
-        return;
-      }
-    }
-
-    // si ya trae dirección y hay algo que pedir, se deriva a humano
-    if (pedidoDirecto.direccion && (!faltaIngrediente || !mencionoPizza) && (!faltaTamano || !mencionoPizza)) {
-      await derivarPedidoAHumano(sock, from, estado, quien, `Dirección detectada: ${pedidoDirecto.direccion}`);
-      return;
-    }
-
-    // si no trae dirección pero ya tiene algo que pedir, pasa a confirmación humana
-    const hayComplementos =
-      Object.keys(estado.complementos || {}).length > 0 ||
-      (estado.lineasComplemento?.length || 0) > 0 ||
-      (estado.lineasBebida?.length || 0) > 0;
-    const pizzaCompleta = !faltaIngrediente && !faltaTamano && (estado.ingredientes?.length > 0);
-    if (pizzaCompleta || hayComplementos) {
-      estado.paso = "confirmar";
-      const rd = resumenDetalladoPedidoParaCliente(estado);
-      await sock.sendMessage(from, {
-        text: `✅ *Checa tu pedido*\n\n${rd}\n\nSi está bien, escribe *confirmar* para pasarte con asesor.`
-      });
-      return;
-    }
-  }
-}
-
-// Resolver ambigüedad de complemento (ej. papas)
-if (estado.paso === "resolver_ambiguedad_complemento") {
-  const idx = Number.parseInt(textoClean, 10);
-  const opciones = Array.isArray(estado.ambOpciones) ? estado.ambOpciones : [];
-  if (!Number.isNaN(idx) && idx >= 1 && idx <= opciones.length) {
-    const elegido = opciones[idx - 1];
-    const cant = Number(estado.ambCantidad || 1);
-    if (!estado.complementos) estado.complementos = {};
-    estado.complementos[elegido] = (estado.complementos[elegido] || 0) + (Number.isNaN(cant) ? 1 : cant);
-    estado.paso = "confirmar";
-    delete estado.ambOpciones;
-    delete estado.ambCantidad;
-    const rAmb = resumenDetalladoPedidoParaCliente(estado);
-    await sock.sendMessage(from, {
-      text: `✅ *Perfecto*\n\n${rAmb}\n\nSi está bien, escribe *confirmar* para pasarte con asesor.`
-    });
-    return;
-  }
-  await sock.sendMessage(from, { text: "❌ Escribe el número de la opción" });
-  return;
-}
-
-if (
-  estado.paso === "confirmar" &&
-  (
-    textoClean === "1" ||
-    esAfirmacionSimple(textoClean) ||
-    textoClean.includes("confirmar")
-  )
-) {
-  await derivarPedidoAHumano(sock, from, estado, quien, "Cliente confirmó pedido en bot.");
-  return;
-}
-
-if (estado.paso === "confirmar" || estado.paso === "confirmar_complementos" || estado.paso === "decision") {
-  const editOnConfirm = aplicarEdicionCarritoNatural(estado, textoClean);
-  if (editOnConfirm) {
-    const rdEdit = resumenDetalladoPedidoParaCliente(estado);
-    await sendText(
-      sock,
-      from,
-      estado,
-      `${editOnConfirm}\n\n🧾 *Pedido actualizado*\n${rdEdit}\n\nResponde *sí* para confirmar o *no* para cancelar.`
-    );
-    return;
-  }
-}
-
-// Cancelar confirmación con opción numérica
-if (
-  estado.paso === "confirmar" &&
-  (textoClean === "2" || esNegacionSimple(textoClean) || textoClean.includes("cancelar"))
-) {
-  resetEstadoCliente(from, estado);
-
-  await sock.sendMessage(from, {
-    text: `❌ Pedido cancelado
-
-👋 Puedes escribir *hola* para comenzar de nuevo`
-  });
-
-  return;
-}
-
-if (!estados[from]) {
-  estados[from] = nuevoEstadoCliente();
-}
-
-  // 📍 DETECTAR UBICACIÓN
-if (msg.message.locationMessage) {
-
-  const lat = msg.message.locationMessage.degreesLatitude;
-  const lng = msg.message.locationMessage.degreesLongitude;
-
-  const estado = estados[from];
-
-  // 👉 si NO está en proceso de pedido
-if (!estado || !["direccion", "promo", "confirmar"].includes(estado.paso)) {
-    await sock.sendMessage(from, {
-      text: `📍 Recibí tu ubicación 👍
-
-Primero cuéntame qué deseas pedir 🍕`
-    });
-
-    return;
-  }
-
-  await derivarPedidoAHumano(
-    sock,
-    from,
-    estado,
-    quien,
-    `Ubicación cliente: https://maps.google.com/?q=${lat},${lng}`
-  );
-  return;
-}
-
-
-// 👨‍💼 HABLAR CON HUMANO
-if (
-  textoClean.includes("humano") ||
-  textoClean.includes("asesor") ||
-  textoClean.includes("persona")
-) {
-  if (estado.paso === "clarificar_salsa_mitad_o_dos") {
-    estado.salsaClarificarUnicas = null;
-    estado.salsaClarificarExtraMitad = null;
-    estado.paso = "solo_complementos";
-  }
-  await sock.sendMessage(from, {
-    text: "👨‍💼 Te paso con alguien del equipo en un momentito."
-  });
-  await notificarUrgenteMovil(sock, {
-    waTitulo: "CLIENTE PIDE ASESOR",
-    waDetalle: `📞 ${quien}\nJID: ${from}\n💬 "${(texto || "").trim()}"`,
-    tgTexto: `🚨 *URGENTE — Cliente pide asesor*\n📞 ${quien}\nJID: ${from}\n💬 "${(texto || "").trim()}"`
-  });
-
-  return;
-}
-
-  // ⚠️ AVISO DE CIERRE (SOLO UNA VEZ)
-  if (porCerrar() && !estado.avisoCierre) {
-    estado.avisoCierre = true;
-
-    await sock.sendMessage(from, {
-      text: `⚠️ Estamos por cerrar en 15 minutos (10:30 PM)
-
-🍔 Si gustas hacer pedido, este es el momento`
-    });
-  }
-
-  // ⛔ VALIDAR HORARIO
-  if (!estaAbierto()) {
-    await sock.sendMessage(from, {
-      text: `⏰ Estamos cerrados en este momento.
-
-🕒 Horario:
-${restaurante.horarioTexto}`
-    });
-
-    return;
-  }
-
-  // 👇 aquí sigue tu lógica normal del bot
-
-  if (!estados[from]) {
-    estados[from] = nuevoEstadoCliente();
-  }
-
-// 👋 SALUDO / MENÚ
-if (detectarSaludoOMenu(textoClean)) {
-  estado.paso = "menu";
-  estado.intentos = 0;
-  estado.promoActivaId = null;
-  await sendText(sock, from, estado, textoMenuPrincipal());
-
-  return;
-}
-
-if (estado.paso === "menu") {
-  const opMenu = detectarOpcionMenuPrincipal(textoClean);
-
-  // 👉 OPCIÓN 1
-  if (opMenu === "1") {
-    estado.paso = "menu_visto";
-
-    await sock.sendMessage(from, {
-      image: { url: "https://picsum.photos/500/500" },
-      caption: `🍔 *Menú El Barón Burger*
-
-1️⃣ Ordenar  
-2️⃣ Hablar con alguien`
-    });
-
-    return;
-  }
-
-  // 👉 OPCIÓN 2
-  if (opMenu === "2") {
-    const promos = obtenerPromosVigentes();
-    estado.paso = "promo";
-    estado.promoActivaId = promos[0]?.id || null;
-    estado.promoOpcionesIds = promos.map((p) => p.id);
-
-    if (!promos.length) {
-      await sock.sendMessage(from, {
-        text: `🔥 *Promociones*\n\n${restaurante.promocionesTexto}\n\n👉 Para pedir: opción *3* o escribe tu pedido.`
-      });
-      estado.paso = "menu";
-      estado.promoActivaId = null;
-      return;
-    }
-
-    const caption = promos
-      .map((p, idx) => `${idx + 1}️⃣ *${p.titulo || "Promo"}*\n${formatearTextoPromoCliente(p)}`)
-      .join("\n\n────────\n\n");
-    const conImg = promos.find((p) => p.imagenUrl && String(p.imagenUrl).trim());
-
-    if (conImg) {
-      await sock.sendMessage(from, {
-        image: { url: String(conImg.imagenUrl).trim() },
-        caption: `${caption.slice(0, 1024)}\n\n👉 Elige una opción con número (ej. 1, 2).`
-      });
-    } else {
-      await sock.sendMessage(from, {
-        text: `🔥 *Promos de hoy*\n\n${caption}\n\n👉 Elige número (1, 2, 3...) o escribe *quiero la promo*. Dudas: *¿incluye refresco?*, *¿qué tamaños?*`
-      });
-    }
-
-    return;
-  }
-
-  // 👉 OPCIÓN 3
-  if (opMenu === "3") {
-    estado.paso = "pedido";
-    estado.ingredientes = [];
-    estado.tamano = null;
-    estado.extrasActivos = {};
-    estado.extrasTotal = 0;
-    estado.extrasLineas = [];
-    estado.upsellPizzaMostrado = false;
-    limpiarMetadatosPromoPedido(estado);
-
-    await sock.sendMessage(from, {
-      text: "🍕 Dime el sabor"
-    });
-
-    return;
-  }
-
-  // 👉 OPCIÓN 4
-  if (opMenu === "4") {
-    estado.paso = "solo_complementos";
-    // Mantener acumulado existente para no perder artículos ya agregados.
-    if (!estado.complementos || typeof estado.complementos !== "object") {
-      estado.complementos = {};
-    }
-    if (!Array.isArray(estado.lineasComplemento)) {
-      estado.lineasComplemento = [];
-    }
-    if (!Array.isArray(estado.lineasBebida)) {
-      estado.lineasBebida = [];
-    }
-
-    await sock.sendMessage(from, {
-      image: { url: "https://picsum.photos/500/600" },
-      caption: `🍟 *COMPLEMENTOS Y BEBIDAS*
-
-${textoListaComplementosYBebidas()}
-
-👉 Número o nombre`
-    });
-
-    return;
-  }
-
-  // 👉 OPCIÓN 5
-  if (opMenu === "5") {
-    await sock.sendMessage(from, {
-      text: "👨‍💼 Te paso con alguien del equipo en un momentito."
-    });
-    await notificarUrgenteMovil(sock, {
-      waTitulo: "MENÚ OPCIÓN 5",
-      waDetalle: `Hablar con asesor\n📞 ${quien}\nJID: ${from}`,
-      tgTexto: `🚨 *URGENTE — Menú opción 5 (hablar con alguien)*\n📞 ${quien}\nJID: ${from}`
-    });
-
-    return;
-  }
-}
-
-// 🍟 SOLO COMPLEMENTOS (+ bebidas del Excel)
-if (estado.paso === "solo_complementos") {
-  const pick = resolverItemCatalogoPorNumeroONombre(textoClean);
-  if (pick) {
-    estado.tempComplemento = pick.nombre;
-    estado.tempEsBebida = pick.tipo === "bebida";
-    if (!estado.tempEsBebida && complementoRequiereSalsa(pick.nombre)) {
-      estado.paso = "elegir_salsa_complemento";
-      await sock.sendMessage(from, {
-        text: textoMenuSalsasAlitas()
-      });
-      return;
-    }
-    estado.paso = "cantidad_complemento";
-    await sock.sendMessage(from, {
-      text: `🔢 ¿Cuántas *${pick.nombre}* deseas?`
-    });
-    return;
-  }
-}
-
-// Mitad y mitad vs dos órdenes (misma elección de salsa ambigua)
-if (estado.paso === "clarificar_salsa_mitad_o_dos") {
-  const uni = estado.salsaClarificarUnicas;
-  const ex = Number(estado.salsaClarificarExtraMitad) || 0;
-  if (!Array.isArray(uni) || uni.length < 2) {
-    estado.paso = "elegir_salsa_complemento";
-    await sock.sendMessage(from, {
-      text: "Volvamos a elegir salsa.\n\n" + textoMenuSalsasAlitas()
-    });
-    return;
-  }
-  const x = sinAcentos(normalizarTextoPedido(textoClean));
-  const esMitad =
-    textoClean === "1" ||
-    /^uno$/.test(x.trim()) ||
-    /\bmitad\s+y\s+mitad\b/.test(x) ||
-    /(misma|mismo)\s+(orden|pedido)/.test(x);
-  const esDos =
-    textoClean === "2" ||
-    /^dos$/.test(x.trim()) ||
-    /\b(orden|pedido)s?\s+separad/.test(x) ||
-    /\bdos\s+orden/.test(x);
-
-  if (esMitad && !esDos) {
-    estado.salsaClarificarUnicas = null;
-    estado.salsaClarificarExtraMitad = null;
-    estado.tempSalsa = {
-      label: `mitad ${uni[0]} / ${uni[1]}`,
-      extraMitadSalsa: ex
-    };
-    estado.paso = "elegir_salsa_complemento";
-    await aplicarPostEleccionSalsa(sock, from, estado, quien);
-    return;
-  }
-  if (esDos && !esMitad) {
-    estado.salsaClarificarUnicas = null;
-    estado.salsaClarificarExtraMitad = null;
-    estado.tempSalsa = { label: uni[0], extraMitadSalsa: 0 };
-    await sock.sendMessage(from, {
-      text: `Perfecto: *dos órdenes*. Esta lleva *${uni[0]}*. Para *${uni[1]}*, después en *¿algo más?* agrega otra vez el complemento y eliges esa salsa.`
-    });
-    estado.paso = "elegir_salsa_complemento";
-    await aplicarPostEleccionSalsa(sock, from, estado, quien);
-    return;
-  }
-
-  await sock.sendMessage(from, {
-    text: `👨‍💼 No capté si quieres *mitad y mitad* o *dos órdenes*. Un asesor te lo confirma.\n\nResponde *1* = mitad y mitad en una orden, *2* = dos órdenes separadas. O escribe *asesor*.`
-  });
-  await notificarUrgenteMovil(sock, {
-    waTitulo: "ASESOR SALSA AMBIGUA",
-    waDetalle: `📞 ${quien}\nJID: ${from}\n💬 "${textoClean}"\nSalsas: ${uni.join(" | ")}`,
-    tgTexto: `🚨 *URGENTE — Asesor (salsa ambigua)*\n📞 ${quien}\nJID: ${from}\n💬 "${textoClean}"\nSalsas: ${uni.join(" | ")}`
-  });
-  estado.paso = "solo_complementos";
-  estado.salsaClarificarUnicas = null;
-  estado.salsaClarificarExtraMitad = null;
-  return;
-}
-
-// 🍗 Elegir salsa (alitas / boneless / nuggets configurados en restaurant.json)
-if (estado.paso === "elegir_salsa_complemento") {
-  const r = parseEleccionSalsa(textoClean);
-
-  if (r.resultado === "humano") {
-    await sock.sendMessage(from, {
-      text: "👨‍💼 Ese pedido de salsas está enredado; te enlazo con un asesor para anotarlo bien."
-    });
-    await notificarUrgenteMovil(sock, {
-      waTitulo: "ASESOR SALSA COMPLEJA",
-      waDetalle: `📞 ${quien}\nJID: ${from}\n💬 "${textoClean}"\n${r.detalle || ""}`,
-      tgTexto: `🚨 *URGENTE — Asesor (salsa compleja)*\n📞 ${quien}\nJID: ${from}\n💬 "${textoClean}"\n_${r.detalle || ""}_`
-    });
-    estado.paso = "solo_complementos";
-    return;
-  }
-
-  if (r.resultado === "preguntar") {
-    estado.paso = "clarificar_salsa_mitad_o_dos";
-    estado.salsaClarificarUnicas = r.unicas;
-    estado.salsaClarificarExtraMitad = r.extraMitad;
-    await sock.sendMessage(from, {
-      text:
-        `Leí *${r.unicas[0]}* y *${r.unicas[1]}*.\n\n¿Cómo lo armamos?\n\n` +
-        `1️⃣ *Mitad y mitad* — una sola orden, mitad una salsa y mitad la otra (+$${r.extraMitad || 0} si aplica)\n` +
-        `2️⃣ *Dos órdenes* — una orden con una salsa y otra orden con la otra\n\n` +
-        `Responde *1* o *2*.`
-    });
-    return;
-  }
-
-  if (r.resultado === "error") {
-    await sock.sendMessage(from, { text: r.msg });
-    return;
-  }
-
-  estado.tempSalsa = {
-    label: r.label,
-    extraMitadSalsa: r.extraMitadSalsa || 0
-  };
-  if (r.notaCliente) {
-    await sock.sendMessage(from, { text: r.notaCliente });
-  }
-  await aplicarPostEleccionSalsa(sock, from, estado, quien);
-  return;
-}
-
-// 🔢 CANTIDAD DE COMPLEMENTO / BEBIDA
-if (estado.paso === "cantidad_complemento") {
-
-  const cantidad = parseInt(textoClean);
-
-  if (!isNaN(cantidad) && cantidad > 0) {
-
-    const comp = estado.tempComplemento;
-    const salsaInfo = estado.tempSalsa || { label: "—", extraMitadSalsa: 0 };
-    const esBeb = !!estado.tempEsBebida;
-    delete estado.tempEsBebida;
-
-    if (esBeb) {
-      delete estado.tempSalsa;
-      if (!estado.lineasBebida) estado.lineasBebida = [];
-      estado.lineasBebida.push({ nombre: comp, cantidad });
-    } else {
-      if (!estado.lineasComplemento) estado.lineasComplemento = [];
-      estado.lineasComplemento.push({
-        nombre: comp,
-        cantidad,
-        salsaEtiqueta: salsaInfo.label,
-        extraMitadSalsa: Number(salsaInfo.extraMitadSalsa) || 0
-      });
-      delete estado.tempSalsa;
-      if (!estado.complementos[comp]) {
-        estado.complementos[comp] = 0;
-      }
-      estado.complementos[comp] += cantidad;
-    }
-
-    const extraTxt =
-      !esBeb && salsaInfo.extraMitadSalsa
-        ? ` +$${salsaInfo.extraMitadSalsa} mix`
-        : "";
-    const salsaTxt = esBeb ? "" : ` (${salsaInfo.label})`;
-
-    await sock.sendMessage(from, {
-      text: `✅ Agregado: ${cantidad} ${comp}${salsaTxt}${extraTxt}
-
-👉 ¿Deseas agregar algo más?
-
-1️⃣ Sí
-2️⃣ No`
-    });
-
-    estado.paso = "agregar_mas";
-    return;
-  } else {
-    await sock.sendMessage(from, {
-      text: "❌ Escribe un número válido"
-    });
-    return;
-  }
-}
-
-// ➕ AGREGAR MÁS COMPLEMENTOS
-if (estado.paso === "agregar_mas") {
-
-  if (textoClean === "1" || textoPideAgregarMasNatural(textoClean)) {
-
-    estado.paso = "solo_complementos";
-    // Si el cliente ya escribió el artículo directamente, saltamos menú y lo tomamos.
-    const pickDirecto = resolverItemCatalogoPorNumeroONombre(textoClean);
-    if (pickDirecto) {
-      estado.tempComplemento = pickDirecto.nombre;
-      estado.tempEsBebida = pickDirecto.tipo === "bebida";
-      if (!estado.tempEsBebida && complementoRequiereSalsa(pickDirecto.nombre)) {
-        estado.paso = "elegir_salsa_complemento";
-        await sendText(sock, from, estado, textoMenuSalsasAlitas());
-        return;
-      }
-      estado.paso = "cantidad_complemento";
-      await sendText(sock, from, estado, `🔢 ¿Cuántas *${pickDirecto.nombre}* deseas?`);
-      return;
-    }
-
-    await sendText(sock, from, estado, `🍟 Elige otro artículo:\n\n${textoListaComplementosYBebidas()}`);
-
-    return;
-  }
-
- if (textoClean === "2" || esNegacionSimple(textoClean)) {
-
-if (!estado.complementos) {
-  estado.complementos = {};
-}
-
-    const { total, resumen } = totalesComplementosYBebidas(estado);
-    const tipVenta = sugerenciaVentaContextual(estado, "resumen_comp");
-    if (tipVenta) {
-      await registrarEventoMetricas("upsell_mostrado", {
-        from,
-        contexto: "resumen_comp"
-      });
-    }
-
-    await sendText(sock, from, estado, `📄 RESUMEN
-
-🍟🥤 ${resumen}
-
-💲 Total: $${total}
-
-👉 Escribe "confirmar" o "cancelar"${tipVenta ? `\n\n${tipVenta}` : ""}`);
-
-    estado.paso = "confirmar_complementos";
-    return;
-  }
-
-  // Entrada directa de artículo sin responder 1/2.
-  const pickNatural = resolverItemCatalogoPorNumeroONombre(textoClean);
-  if (pickNatural) {
-    estado.tempComplemento = pickNatural.nombre;
-    estado.tempEsBebida = pickNatural.tipo === "bebida";
-    if (!estado.tempEsBebida && complementoRequiereSalsa(pickNatural.nombre)) {
-      estado.paso = "elegir_salsa_complemento";
-      await sendText(sock, from, estado, textoMenuSalsasAlitas());
-      return;
-    }
-    estado.paso = "cantidad_complemento";
-    await sendText(sock, from, estado, `🔢 ¿Cuántas *${pickNatural.nombre}* deseas?`);
-    return;
-  }
-}
-
-
-    // 🔥 OPCIONES DESPUÉS DEL MENÚ
-    if (estado.paso === "menu_visto") {
-
-      if (textoClean === "1") {
-        estado.paso = "pedido";
-        estado.ingredientes = [];
-        estado.tamano = null;
-        estado.extrasActivos = {};
-        estado.extrasTotal = 0;
-        estado.extrasLineas = [];
-        estado.upsellPizzaMostrado = false;
-        limpiarMetadatosPromoPedido(estado);
-
-        await sock.sendMessage(from, {
-          text: "🍕 Dime el sabor (peperoni, hawaiana, etc)"
-        });
-
-        return;
-      }
-
-      if (textoClean === "2") {
-        await sock.sendMessage(from, {
-          text: "👨‍💼 Te paso con alguien del equipo en un momentito."
-        });
-
-        return;
-      }
-    }
-
-
-// ✅ CONFIRMAR SOLO COMPLEMENTOS
-if (estado.paso === "confirmar_complementos") {
-  if (textoClean === "1" || esAfirmacionSimple(textoClean) || textoClean.includes("confirmar")) {
-    await derivarPedidoAHumano(sock, from, estado, quien, "Cliente confirmó complemento/bebida.");
-    return;
-  }
-
-  if (textoClean === "2" || esNegacionSimple(textoClean) || textoClean.includes("cancelar")) {
-    delete estados[from];
-
-    await sock.sendMessage(from, {
-      text: "❌ Pedido cancelado\n\n👉 Escribe *hola* para comenzar de nuevo"
-    });
-
-    return;
-  }
-}
-
-    // 🍕 PEDIDO
-
-// ✅ DECISIÓN (PONLO ARRIBA)
-if (estado.paso === "decision") {
-
-  if (textoClean === "1" || esAfirmacionSimple(textoClean) || textoClean.includes("confirmar")) {
-    await derivarPedidoAHumano(sock, from, estado, quien, "Cliente confirmó en paso decision.");
-    return;
-  }
-
-  if (textoClean === "2" || esNegacionSimple(textoClean) || textoClean.includes("cancelar")) {
-    delete estados[from];
-
-    await sock.sendMessage(from, {
-      text: "❌ Pedido cancelado\n\n👉 Escribe *hola* para comenzar de nuevo"
-    });
-
-    return;
-  }
-}
-
-// 🍕 PEDIDO INTELIGENTE
-if (estado.paso === "pedido") {
-  if (esPreguntaIngredientesPizza(textoClean)) {
-    if (await manejarConsultaDescripcionPizza(sock, from, quien, textoClean)) {
-      return;
-    }
-  }
-
-  const ingredientesDetectados = detectarIngredientes(textoClean);
-  const tamanoDetectado = detectarTamano(textoClean);
-  const tNorm = sinAcentos(normalizarTextoPedido(textoClean));
-  const pideMitad =
-    /(mitad\s*y\s*mitad|media\s*y\s*media|dos\s*sabores)/.test(tNorm);
-
-  // guardar ingredientes
-  if (ingredientesDetectados.length > 0) {
-    let ing = ingredientesDetectados;
-    if (pideMitad && ing.length > 2) ing = ing.slice(0, 2);
-    estado.ingredientes = ing;
-  }
-
-  // guardar tamaño si viene en el mensaje
-  if (tamanoDetectado) {
-    estado.tamano = tamanoDetectado;
-  }
-
-  mergeExtrasEnEstado(estado, textoClean);
-
-  // 🔥 CASO 1: tiene TODO
-  if (estado.ingredientes.length > 0 && estado.tamano) {
-
-    const up = restaurante?.upsell?.alConfirmarPizza;
-    let upsTxt = "";
-    if (up?.activo && !estado.upsellPizzaMostrado) {
-      upsTxt = up.texto || "";
-      estado.upsellPizzaMostrado = true;
-    }
-
-    const cuerpo = resumenDetalladoPedidoParaCliente(estado);
-    const tipVenta = sugerenciaVentaContextual(estado, "confirmar_pizza");
-    if (tipVenta) {
-      await registrarEventoMetricas("upsell_mostrado", {
-        from,
-        contexto: "confirmar_pizza"
-      });
-    }
-    await sock.sendMessage(from, {
-      text: `${cuerpo}
-
-👉 ¿Deseas continuar?
-
-1️⃣ Confirmar pedido
-2️⃣ Cancelar${upsTxt}${tipVenta ? `\n\n${tipVenta}` : ""}`
-    });
-
-    estado.paso = "confirmar";
-    return;
-  }
-
-  // 🔥 CASO 2: tiene ingrediente pero NO tamaño
-  if (estado.ingredientes.length > 0 && !estado.tamano) {
-
-    estado.paso = "tamano";
-
-    await sock.sendMessage(from, {
-      image: { url: "https://picsum.photos/500/600" },
-      caption: `📏 ¿Qué tamaño quieres?
-
-1️⃣ Mediana  
-2️⃣ Grande  
-3️⃣ Familiar  
-4️⃣ Jumbo  
-5️⃣ Mega`
-    });
-
-    return;
-  }
-
-  // ❌ no entendió
-  await sock.sendMessage(from, {
-      text: "🍕 Cuéntame el sabor de tu pizza (ej. hawaiana, peperoni)."
-  });
-
-  return;
-}
-
-// 📏 SELECCIÓN DE TAMAÑO
-if (estado.paso === "tamano") {
-  if (esPreguntaIngredientesPizza(textoClean)) {
-    if (await manejarConsultaDescripcionPizza(sock, from, quien, textoClean)) {
-      return;
-    }
-  }
-
-  const mapa = {
-    "1": "mediana",
-    "2": "grande",
-    "3": "familiar",
-    "4": "jumbo",
-    "5": "mega"
-  };
-
-  const tamano = mapa[textoClean];
-
-  if (tamano) {
-    estado.tamano = tamano;
-
-    mergeExtrasEnEstado(estado, textoClean);
-
-    const up2 = restaurante?.upsell?.alConfirmarPizza;
-    let upsTxt2 = "";
-    if (up2?.activo && !estado.upsellPizzaMostrado) {
-      upsTxt2 = up2.texto || "";
-      estado.upsellPizzaMostrado = true;
-    }
-
-    const cuerpo2 = resumenDetalladoPedidoParaCliente(estado);
-    const tipVenta2 = sugerenciaVentaContextual(estado, "confirmar_tamano");
-    if (tipVenta2) {
-      await registrarEventoMetricas("upsell_mostrado", {
-        from,
-        contexto: "confirmar_tamano"
-      });
-    }
-    await sock.sendMessage(from, {
-      text: `${cuerpo2}
-
-👉 ¿Deseas continuar?
-
-1️⃣ Confirmar pedido
-2️⃣ Cancelar${upsTxt2}${tipVenta2 ? `\n\n${tipVenta2}` : ""}`
-    });
-
-    estado.paso = "confirmar";
-    return;
-  }
-}
-
-    // ✅ CONFIRMAR
-    if (textoClean.includes("decision")) {
-      estado.paso = "confirmar";
-
-      await sock.sendMessage(from, {
-        text: "✅ Perfecto. Escribe *confirmar* para pasarte con asesor y cerrar tu pedido."
-      });
-
-      return;
-    }
-
-    // 📍 DIRECCIÓN
-if (estado.paso === "direccion") {
-  await derivarPedidoAHumano(sock, from, estado, quien, texto.trim());
-  return;
-}
-
-// 🍕 PEDIR PROMO
-if (estado.paso === "promo") {
-  const nPromo = detectarNumeroEnTexto(textoClean);
-  if (nPromo && nPromo >= 1) {
-    const ids = Array.isArray(estado.promoOpcionesIds) ? estado.promoOpcionesIds : [];
-    const selId = ids[nPromo - 1];
-    if (selId) {
-      estado.promoActivaId = selId;
-      const pSel = (restaurante.promociones || []).find((x) => x.id === selId);
-      if (pSel) {
-        const cap = `✅ Elegiste: *${pSel.titulo || "Promo"}*\n\n${formatearTextoPromoCliente(pSel)}\n\nSi te gusta, escribe *quiero la promo*.`;
-        if (pSel.imagenUrl && String(pSel.imagenUrl).trim()) {
-          await sock.sendMessage(from, { image: { url: String(pSel.imagenUrl).trim() }, caption: cap });
-        } else {
-          await sock.sendMessage(from, { text: cap });
-        }
-        return;
-      }
-    }
-  }
-
-  const rPromoChat = buscarRespuestaPromoActiva(estado, textoClean);
-  if (rPromoChat) {
-    await sock.sendMessage(from, { text: rPromoChat });
-    return;
-  }
-
-  if (
-    textoClean.includes("quiero") ||
-    textoClean.includes("dame") ||
-    textoClean.includes("si") ||
-    textoClean.includes("ok") ||
-    textoClean.includes("va")
-  ) {
-    estado.paso = "confirmar";
-    estado.desdePromoPedido = true;
-    const p = (restaurante.promociones || []).find(
-      (x) => x.id === estado.promoActivaId
-    );
-    estado.referenciaPromoCliente = p?.titulo
-      ? `${p.titulo} (promo)`
-      : "Promoción del día";
-
-    const rPr = resumenDetalladoPedidoParaCliente(estado);
-    await sock.sendMessage(from, {
-      text: `✅ *¡Listo, promo registrada!*\n\n${rPr}\n\nSi está bien, escribe *confirmar* para pasarte con asesor.`
-    });
-
-    return;
-  }
-
-  if (textoClean.length > 10) {
-    estado.paso = "confirmar";
-    estado.desdePromoPedido = true;
-    estado.referenciaPromoCliente = texto.trim().slice(0, 400);
-
-    const rLargo = resumenDetalladoPedidoParaCliente(estado);
-    await sock.sendMessage(from, {
-      text: `✅ *¡Pedido registrado!*\n\n${rLargo}\n\nSi está bien, escribe *confirmar* para pasarte con asesor.\n\n⏱ Entrega aprox. 30–40 min`
-    });
-
-    return;
-  }
-}
-
-    // 🤖 DEFAULT
-    estado.intentos++;
-
-if (estado.intentos >= 2) {
-  // Antes de derivar a un asesor humano, intentamos resolver con Groq.
-  const contexto = construirContextoCatalogo();
-
-  const r = await preguntarAGroqConIndicador(
-    sock,
-    from,
-    quien,
-    textoClean,
-    contexto
-  );
-
-  if (r.manejado) {
-    estado.intentos = 0;
-  } else if (r.texto) {
-    await sock.sendMessage(from, { text: r.texto });
-    estado.intentos = 0;
-  } else {
-    await sock.sendMessage(from, {
-      text: "👨‍💼 No estoy seguro de entender eso. Te paso con un asesor para que te ayude mejor."
-    });
-    await notificarUrgenteMovil(sock, {
-      waTitulo: "DERIVACIÓN A ASESOR",
-      waDetalle: `Bot no entendió\n📞 ${quien}\nJID: ${from}\n💬 ${textoClean}`,
-      tgTexto: `🚨 *URGENTE — Derivación (bot no entendió)*\n📞 ${quien}\nJID: ${from}\n💬 ${textoClean}`
-    });
-    estado.intentos = 0;
-  }
-} else {
-  await sock.sendMessage(from, {
-    text: "🤖 No te caché bien.\n\nEscribe *menu* para empezar, *carrito* para ver total o *ayuda*."
-  });
-}
   } catch (err) {
     console.error("❌ Error en messages.upsert:", err?.message || err);
   }
@@ -4056,3 +3294,4 @@ app.listen(PORT, () => {
   console.log(`🌐 Servidor activo en puerto ${PORT}`);
   startBot();
 });
+
