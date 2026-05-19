@@ -1163,8 +1163,8 @@ function serializarEstadoCliente(estado) {
   if (estado.extrasLineas?.length) {
     lines.push(`- Extras: ${estado.extrasLineas.join(", ")}`);
   }
-  const { cb } = totalesComplementosYBebidas(estado);
-  if (cb.resumen) lines.push(`- Complementos/bebidas: ${cb.resumen}`);
+  const cbTotales = totalesComplementosYBebidas(estado);
+  if (cbTotales.resumen) lines.push(`- Complementos/bebidas: ${cbTotales.resumen}`);
   if (estado.tipoServicio) lines.push(`- Servicio: ${estado.tipoServicio}`);
   if (estado.dirCalle) lines.push(`- Calle y número: ${estado.dirCalle}`);
   if (estado.dirEntre) lines.push(`- Entre calles: ${estado.dirEntre}`);
