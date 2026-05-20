@@ -15,6 +15,9 @@ const DEFAULT_CONFIG = {
   ingredientAliases: {},
   promoDestacada: null,
   instruccionesCarly: "",
+  consultasAprendidas: {},
+  consultasAliasesManual: {},
+  faqsExtras: [],
   updatedAt: null
 };
 
@@ -58,6 +61,15 @@ function mergeConfig(parsed) {
   if (base.overrideAbierto !== true && base.overrideAbierto !== false) {
     base.overrideAbierto = null;
   }
+  base.consultasAprendidas =
+    base.consultasAprendidas && typeof base.consultasAprendidas === "object"
+      ? base.consultasAprendidas
+      : {};
+  base.consultasAliasesManual =
+    base.consultasAliasesManual && typeof base.consultasAliasesManual === "object"
+      ? base.consultasAliasesManual
+      : {};
+  base.faqsExtras = Array.isArray(base.faqsExtras) ? base.faqsExtras : [];
   mem = base;
   return mem;
 }
@@ -116,6 +128,18 @@ async function setIngredientAliases(ingredientAliases) {
   return savePartial({ ingredientAliases: ingredientAliases || {} });
 }
 
+async function setConsultasAprendidas(consultasAprendidas) {
+  return savePartial({ consultasAprendidas: consultasAprendidas || {} });
+}
+
+async function setConsultasAliasesManual(consultasAliasesManual) {
+  return savePartial({ consultasAliasesManual: consultasAliasesManual || {} });
+}
+
+async function setFaqsExtras(faqsExtras) {
+  return savePartial({ faqsExtras: Array.isArray(faqsExtras) ? faqsExtras : [] });
+}
+
 module.exports = {
   init,
   getConfig,
@@ -124,5 +148,8 @@ module.exports = {
   savePartial,
   setAliasesAprendidos,
   setIngredientAliases,
+  setConsultasAprendidas,
+  setConsultasAliasesManual,
+  setFaqsExtras,
   DEFAULT_CONFIG
 };

@@ -27,6 +27,10 @@ const botConfigStore = require("./bot-config-store");
 const telegramAdmin = require("./telegram-admin");
 const carlyIntents = require("./carly-intents");
 const groqCarlyLite = require("./groq-carly-lite");
+const promoImagenes = require("./promo-imagenes");
+const pagoCarly = require("./pago-carly");
+const consultasCarly = require("./consultas-carly");
+const RESPUESTA_LOCAL_YA_ENVIADA = "__RESPUESTA_LOCAL_YA_ENVIADA__";
 
 // Firestore (opcional). Si falta clave.json o falla la inicialización, el bot
 // sigue funcionando con persistencia local.
@@ -353,6 +357,7 @@ function defaultRestaurante() {
       mega: 40
     },
     ingredientAliases: {},
+    consultasAliases: {},
     faqs: [],
     extras: [],
     alitasBonelessSalsas: {
@@ -380,7 +385,18 @@ function defaultRestaurante() {
         "🥤 Si pediste pizza *grande o mayor*, puede aplicar *refresco gratis* según promo. *Conserva este chat* por si hace falta aclararlo en entrega."
     },
     aliasesAprendidos: {},
-    fuzzy: { umbralAlto: 0.88, umbralMedio: 0.72, minVecesSiParaAviso: 5 }
+    fuzzy: { umbralAlto: 0.88, umbralMedio: 0.72, minVecesSiParaAviso: 5 },
+    formasPago: {
+      textoEfectivoTransferencia: "💳 Aceptamos efectivo y transferencia.",
+      textoNoTarjeta: "💳 No manejamos tarjeta; solo efectivo y transferencia.",
+      textoNoFactura: "📄 No facturamos. Pago en efectivo o transferencia.",
+      textoSiTransferencia: "✅ Sí, aceptamos transferencia. Te mando los datos 👇",
+      textoTransferenciaPedido:
+        "✅ Transfiere y guarda tu comprobante; el equipo confirma tu pedido.",
+      textoPreguntaMetodo: "💳 ¿Tu pago será efectivo o transferencia?",
+      textoPreguntaEfectivoMonto: "💵 ¿Con cuánto vas a pagar? (ej. 500)",
+      cuentasImagenUrls: []
+    }
   };
 }
 
@@ -420,6 +436,13 @@ function cargarRestaurante() {
         ...def.recordatorioRefrescoGratis,
         ...(parsed.recordatorioRefrescoGratis || {})
       },
+      formasPago: {
+        ...def.formasPago,
+        ...(parsed.formasPago || {}),
+        cuentasImagenUrls: Array.isArray(parsed.formasPago?.cuentasImagenUrls)
+          ? parsed.formasPago.cuentasImagenUrls
+          : def.formasPago.cuentasImagenUrls
+      },
       aliasesAprendidos: {
         ...def.aliasesAprendidos,
         ...(parsed.aliasesAprendidos || {})
@@ -458,6 +481,8 @@ async function recargarRestauranteSiCambioAsync() {
       restaurante = cargarRestaurante();
       aplicarBotConfigAMemoria(botConfigStore.getConfig());
       initCarlyIntents();
+      initPagoCarly();
+      initConsultasCarly();
       console.log("✅ restaurant.json recargado");
     }
   } catch {
@@ -1233,7 +1258,8 @@ function etiquetaPasoPedido(paso) {
     E: "domicilio o recoger",
     F: "dirección de entrega",
     G: "confirmación del pedido",
-    H: "pedido confirmado"
+    H: "forma de pago",
+    I: "monto en efectivo"
   };
   return map[paso] || paso;
 }
@@ -1269,7 +1295,7 @@ function serializarEstadoCliente(estado) {
   } else if (estado.subPasoDireccion === "referencia") {
     lines.push("- Falta: referencia o color de casa");
   }
-  if (estado.pasoPedido === "G" || estado.pasoPedido === "H") {
+  if (estado.pasoPedido === "G" || estado.pasoPedido === "H" || estado.pasoPedido === "I") {
     const resumen = resumenDetalladoPedidoParaCliente(estado);
     if (resumen) {
       lines.push("- Resumen actual:");
@@ -1277,6 +1303,8 @@ function serializarEstadoCliente(estado) {
     }
     const { total } = subtotalesPedidoActuales(estado);
     if (total > 0) lines.push(`- Total calculado: $${total}`);
+    if (estado.formaPago) lines.push(`- Forma de pago: ${estado.formaPago}`);
+    if (estado.pagoCon != null) lines.push(`- Paga con: $${estado.pagoCon}`);
   }
   return lines.length ? lines.join("\n") : "- Cliente nuevo / conversación general";
 }
@@ -1451,8 +1479,15 @@ function aplicarBotConfigAMemoria(cfg) {
       ...c.ingredientAliases
     };
   }
+  if (c.consultasAliasesManual && Object.keys(c.consultasAliasesManual).length) {
+    restaurante.consultasAliasesManualPanel = { ...c.consultasAliasesManual };
+  }
+  if (c.consultasAprendidas && Object.keys(c.consultasAprendidas).length) {
+    restaurante.consultasAprendidas = { ...c.consultasAprendidas };
+  }
   rebuildDetectCache();
   if (typeof initFuzzyCarly === "function") initFuzzyCarly();
+  if (typeof initConsultasCarly === "function") initConsultasCarly();
 }
 
 function groqEstaActivo() {
@@ -1560,6 +1595,83 @@ async function aliasPanelDel(typo) {
     : `ℹ️ No estaba en aprendidos. Revisa /alias list`;
 }
 
+function textoFaqListadoPanel() {
+  const faqs = obtenerFaqsEfectivas();
+  if (!faqs.length) return "Sin FAQs. Usa:\n/faq add palabras clave | Tu respuesta aquí";
+  const lines = ["*FAQs activas:*"];
+  faqs.forEach((f, i) => {
+    const tr = String(f.triggers || "").slice(0, 60);
+    lines.push(`${i + 1}. \`${tr}\``);
+  });
+  const extra = (botConfigStore.getConfig().faqsExtras || []).length;
+  lines.push(`\n_${extra} agregadas por Telegram (Firestore)._`);
+  return lines.join("\n");
+}
+
+async function faqPanelAdd(triggers, respuesta) {
+  const tr = String(triggers || "").trim();
+  const resp = String(respuesta || "").trim();
+  if (!tr || !resp) return "❌ Uso: /faq add palabras clave | Respuesta";
+  const arr = [...(botConfigStore.getConfig().faqsExtras || [])];
+  arr.push({ triggers: tr, respuesta: resp });
+  await botConfigStore.setFaqsExtras(arr);
+  return `✅ FAQ #${arr.length} guardada en Firestore.\n*Triggers:* ${tr}`;
+}
+
+async function faqPanelDel(indice) {
+  const n = Number(indice);
+  const baseLen = (restaurante.faqs || []).length;
+  const arr = [...(botConfigStore.getConfig().faqsExtras || [])];
+  const idx = n - 1 - baseLen;
+  if (!Number.isFinite(n) || idx < 0 || idx >= arr.length) {
+    return `❌ Solo puedes borrar FAQs del panel (#${baseLen + 1} en adelante). Usa /faq list`;
+  }
+  const removed = arr.splice(idx, 1)[0];
+  await botConfigStore.setFaqsExtras(arr);
+  return `✅ FAQ eliminada: ${String(removed?.triggers || "").slice(0, 40)}`;
+}
+
+async function consultaPanelAdd(typo, accion) {
+  const t = sinAcentos(normalizarTextoPedido(typo));
+  const a = String(accion || "").toLowerCase().trim();
+  if (!t || !a) return "❌ Uso: /consulta add typo → accion\nAcciones: /consulta";
+  if (!consultasCarly.ACCIONES[a]) {
+    return `❌ Acción "${a}" no existe. Escribe /consulta para ver la lista.`;
+  }
+  const ap = { ...(botConfigStore.getConfig().consultasAprendidas || {}) };
+  ap[t] = { accion: a, veces: (ap[t]?.veces || 0) + 1 };
+  await botConfigStore.setConsultasAprendidas(ap);
+  initConsultasCarly();
+  return `✅ Consulta: "${t}" → *${a}*`;
+}
+
+async function consultaPanelManual(accion, typosCsv) {
+  const a = String(accion || "").toLowerCase().trim();
+  if (!a || !consultasCarly.ACCIONES[a]) {
+    return "❌ Uso: /consulta manual accion → typo1, typo2\nEj: /consulta manual horario → q orario, a q hora abren";
+  }
+  const cfg = botConfigStore.getConfig();
+  const man = { ...(cfg.consultasAliasesManual || {}) };
+  const prev = String(man[a] || "");
+  const nuevos = listaTriggersCsv(typosCsv).join(", ");
+  man[a] = prev ? `${prev}, ${nuevos}` : nuevos;
+  await botConfigStore.setConsultasAliasesManual(man);
+  initConsultasCarly();
+  return `✅ Manual *${a}* actualizado (+${listaTriggersCsv(typosCsv).length} typos)`;
+}
+
+async function consultaPanelDel(typo) {
+  const t = sinAcentos(normalizarTextoPedido(typo));
+  const ap = { ...(botConfigStore.getConfig().consultasAprendidas || {}) };
+  if (ap[t]) {
+    delete ap[t];
+    await botConfigStore.setConsultasAprendidas(ap);
+    initConsultasCarly();
+    return `✅ Eliminada consulta aprendida "${t}"`;
+  }
+  return `ℹ️ "${t}" no está en aprendidas. Usa /consulta`;
+}
+
 function registrarAprendizajeIntentsAsync(entry) {
   const row = { ts: new Date().toISOString(), ...entry };
   return fsp.appendFile("aprendizaje_intents.jsonl", JSON.stringify(row) + "\n", "utf8").catch(() => {});
@@ -1586,12 +1698,79 @@ function initCarlyIntents() {
     textoDescripcionLocalPizza,
     obtenerPromosVigentes,
     formatearTextoPromoCliente,
+    textoListaCombosVigentes,
+    textoMenuSalsasAlitas,
+    esConsultaMenuSalsasAlitas,
     calcularPrecio,
     capitalizar,
     estaAbiertoEfectivo,
     resumenDetalladoPedidoParaCliente,
     appendLog: registrarAprendizajeIntentsAsync
   });
+}
+
+function initPagoCarly() {
+  pagoCarly.init({
+    getRestaurante: () => restaurante,
+    sinAcentos,
+    normalizarTextoPedido
+  });
+}
+
+function initConsultasCarly() {
+  consultasCarly.init({
+    getRestaurante: () => restaurante,
+    getConfig: () => botConfigStore.getConfig(),
+    sinAcentos,
+    normalizarTextoPedido,
+    sendText,
+    estaAbiertoEfectivo,
+    pagoCarly,
+    obtenerPromosVigentes,
+    enviarPromosAlCliente,
+    enviarCombosAlCliente,
+    enviarMenuSalsasAlCliente
+  });
+}
+
+async function manejarPasoPagoPedido(sock, from, estado, quien, textoClean) {
+  const c = pagoCarly.cfg();
+
+  if (estado.pasoPedido === "H") {
+    const metodo = pagoCarly.detectarMetodoPagoEnTexto(textoClean);
+    if (!metodo) {
+      await sendText(sock, from, estado, c.textoMetodoNoEntendido);
+      return true;
+    }
+    estado.formaPago = metodo;
+    if (metodo === "transferencia") {
+      await sendText(sock, from, estado, c.textoTransferenciaPedido);
+      await pagoCarly.enviarImagenesCuentasTransferencia(sock, from);
+      await confirmarPedidoYPasarAHumano(sock, from, estado, quien);
+      return true;
+    }
+    estado.pasoPedido = "I";
+    await sendText(sock, from, estado, c.textoPreguntaEfectivoMonto);
+    return true;
+  }
+
+  if (estado.pasoPedido === "I") {
+    const monto = pagoCarly.parseMontoPago(textoClean);
+    if (!monto) {
+      await sendText(sock, from, estado, c.textoMontoNoEntendido);
+      return true;
+    }
+    const { total } = subtotalesPedidoActuales(estado);
+    if (monto < total) {
+      await sendText(sock, from, estado, c.textoMontoInsuficiente(total));
+      return true;
+    }
+    estado.pagoCon = monto;
+    await confirmarPedidoYPasarAHumano(sock, from, estado, quien);
+    return true;
+  }
+
+  return false;
 }
 
 function initFuzzyCarly() {
@@ -1619,7 +1798,126 @@ function initFuzzyCarly() {
   });
 }
 
+function textoListaPromosVigentes(promos) {
+  if (!promos?.length) {
+    return `🔥 ${restaurante.promocionesTexto || "Hoy no hay promos activas en el sistema."}`;
+  }
+  const lineas = promos.map((p, i) => {
+    const tit = p.titulo || p.id || `Promo ${i + 1}`;
+    const img = promoImagenes.promoTieneImagen(p) ? " 📷" : "";
+    return `*${i + 1}.* ${tit}${img}\n${formatearTextoPromoCliente(p)}`;
+  });
+  return `🔥 *Promos de hoy:*\n\n${lineas.join("\n\n")}\n\n¿Cuál te interesa o qué pizza quieres? 🍕`;
+}
+
+async function enviarPromosAlCliente(sock, from, estado, promos) {
+  await sendText(sock, from, estado, textoListaPromosVigentes(promos));
+  await enviarImagenesPromosConfiguradas(sock, from, promos);
+}
+
+async function enviarImagenesPromosConfiguradas(sock, from, promos) {
+  const conImg = (promos || []).filter((p) => promoImagenes.promoTieneImagen(p));
+  if (!conImg.length) return;
+  const { enviadas, fallidas } = await promoImagenes.enviarImagenesDePromos(sock, from, conImg);
+  if (fallidas > 0 && enviadas === 0) {
+    await sendText(
+      sock,
+      from,
+      null,
+      "📷 Las fotos se están actualizando — si no las ves, pregunta en tienda 😊\n_(URL Firebase en imagenUrl)_"
+    );
+  }
+}
+
+function esConsultaMenuSalsasAlitas(t) {
+  const x = sinAcentos(normalizarTextoPedido(t));
+  const keys = String(restaurante.alitasBonelessSalsas?.aplicaA || "alitas, boneless, wings, nuggets")
+    .split(",")
+    .map((k) => sinAcentos(k.trim()))
+    .filter((k) => k.length >= 3);
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const mencionaProducto =
+    keys.some((k) => new RegExp(`\\b${esc(k)}\\b`).test(x)) ||
+    /\b(alitas|boneless|wings|nuggets)\b/.test(x);
+  if (/(que\s+salsas|cuales\s+salsas|menu\s+de\s+salsas|lista\s+de\s+salsas|sabores?\s+de\s+salsa)/.test(x)) {
+    return true;
+  }
+  if (mencionaProducto && /\b(salsas?)\b/.test(x)) return true;
+  if (
+    mencionaProducto &&
+    /(que\s+tienen|opciones|menu|catalogo|cartel)/.test(x) &&
+    !esConsultaPrecio(t)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function esConsultaCombosCliente(t) {
+  const x = sinAcentos(normalizarTextoPedido(t));
+  if (/\b(promos?|promocion|ofertas?)\b/.test(x)) return false;
+  if (!/\b(combos?|paquetes?)\b/.test(x)) return false;
+  if (esConsultaPrecio(t)) return false;
+  return true;
+}
+
+function enPasoEleccionSalsa(estado) {
+  const p = estado?.paso || estado?.pasoPedido;
+  return p === "elegir_salsa_complemento" || p === "clarificar_salsa_mitad_o_dos";
+}
+
+function textoListaCombosVigentes() {
+  const combos = obtenerCombosVigentesHoy();
+  if (!combos.length) {
+    return `🧺 ${restaurante.combosTexto || "Consulta combos del día en tienda."}`;
+  }
+  const lineas = combos.map((p, i) => {
+    const tit = p.titulo || p.id || `Combo ${i + 1}`;
+    const img = promoImagenes.promoTieneImagen(p) ? " 📷" : "";
+    return `*${i + 1}.* ${tit}${img}\n${formatearTextoPromoCliente(p)}`;
+  });
+  return `🧺 *Combos de hoy:*\n\n${lineas.join("\n\n")}\n\n¿Cuál te interesa? 🍕`;
+}
+
+async function enviarMenuSalsasAlCliente(sock, from, estado) {
+  await sendText(sock, from, estado, textoMenuSalsasAlitas());
+  const url = restaurante.alitasBonelessSalsas?.imagenUrl;
+  if (url && String(url).trim()) {
+    await promoImagenes.enviarUnaImagen(sock, from, url, "🍗 Salsas alitas / boneless");
+  }
+}
+
+async function enviarImagenesCombosAlCliente(sock, from) {
+  const general = restaurante.combosImagenGeneralUrl;
+  if (general && String(general).trim()) {
+    await promoImagenes.enviarUnaImagen(sock, from, general, "🧺 Combos");
+  }
+  const combos = obtenerCombosVigentesHoy().filter((p) => promoImagenes.promoTieneImagen(p));
+  if (combos.length) {
+    await promoImagenes.enviarImagenesDePromos(sock, from, combos);
+  }
+}
+
+async function enviarCombosAlCliente(sock, from, estado) {
+  await sendText(sock, from, estado, textoListaCombosVigentes());
+  await enviarImagenesCombosAlCliente(sock, from);
+}
+
 async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto) {
+  if (!["G", "H", "I"].includes(estado.pasoPedido)) {
+    const rConsulta = await consultasCarly.intentarRespuesta(sock, from, estado, textoClean);
+    if (rConsulta === "__ENVIADO__") return RESPUESTA_LOCAL_YA_ENVIADA;
+
+    const rPago = await pagoCarly.intentarRespuestaConsulta(
+      sock,
+      from,
+      estado,
+      textoClean,
+      sendText
+    );
+    if (rPago === "__ENVIADO__") return RESPUESTA_LOCAL_YA_ENVIADA;
+  }
+
   const faq = buscarRespuestaFaq(textoClean);
   if (faq) return faq;
 
@@ -1631,8 +1929,31 @@ async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto
       escalar: !!multi.escalarHumano,
       pasoPedido: estado.pasoPedido || null
     });
+    await sendText(sock, from, estado, multi.texto);
+    if (multi.intents?.includes("promo")) {
+      await enviarImagenesPromosConfiguradas(sock, from, obtenerPromosVigentes());
+    }
+    if (multi.intents?.includes("combo")) {
+      await enviarImagenesCombosAlCliente(sock, from);
+    }
+    if (multi.intents?.includes("salsas_alitas")) {
+      const url = restaurante.alitasBonelessSalsas?.imagenUrl;
+      if (url && String(url).trim()) {
+        await promoImagenes.enviarUnaImagen(sock, from, url, "🍗 Salsas alitas / boneless");
+      }
+    }
     if (multi.escalarHumano) estado.escalarTrasRespuesta = true;
-    return multi.texto;
+    return RESPUESTA_LOCAL_YA_ENVIADA;
+  }
+
+  if (!enPasoEleccionSalsa(estado) && esConsultaMenuSalsasAlitas(textoClean)) {
+    await enviarMenuSalsasAlCliente(sock, from, estado);
+    return RESPUESTA_LOCAL_YA_ENVIADA;
+  }
+
+  if (!estado.pasoPedido && esConsultaCombosCliente(textoClean)) {
+    await enviarCombosAlCliente(sock, from, estado);
+    return RESPUESTA_LOCAL_YA_ENVIADA;
   }
 
   const info = responderServicioHorarioPromoCombo(textoClean);
@@ -1656,15 +1977,8 @@ async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto
   if (descLocal) return descLocal;
 
   if (/(promo|promocion|oferta)\b/.test(textoClean) && !estado.pasoPedido) {
-    const promos = obtenerPromosVigentes();
-    if (!promos.length) {
-      return `🔥 ${restaurante.promocionesTexto || "Hoy no hay promos activas en el sistema."}`;
-    }
-    const lineas = promos.map((p, i) => {
-      const tit = p.titulo || p.id || `Promo ${i + 1}`;
-      return `*${i + 1}.* ${tit}\n${formatearTextoPromoCliente(p)}`;
-    });
-    return `🔥 *Promos de hoy:*\n\n${lineas.join("\n\n")}\n\n¿Cuál te interesa o qué pizza quieres? 🍕`;
+    await enviarPromosAlCliente(sock, from, estado, obtenerPromosVigentes());
+    return RESPUESTA_LOCAL_YA_ENVIADA;
   }
 
   const analisis = fuzzyCarly.analizarMensaje(textoClean, estado);
@@ -1680,7 +1994,18 @@ async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto
     if (!estado.pasoPedido && (analisis.propuesta.tipo === "pizza" || analisis.propuesta.tipo === "mitad_mitad")) {
       estado.pasoPedido = estado.tamano ? "C" : "B";
     }
-    return mensajeSeguimientoTrasFuzzy(estado, analisis.propuesta);
+    await sendText(sock, from, estado, mensajeSeguimientoTrasFuzzy(estado, analisis.propuesta));
+    if (analisis.propuesta.tipo === "promo") {
+      const promos = obtenerPromosVigentes();
+      const p =
+        promos.find((x) => x.id === analisis.propuesta.promoId) ||
+        promos.find((x) => (x.titulo || x.id) === analisis.propuesta.titulo) ||
+        promos[0];
+      if (p && promoImagenes.promoTieneImagen(p)) {
+        await promoImagenes.enviarUnaImagen(sock, from, p.imagenUrl, `🔥 ${p.titulo || "Promo"}`);
+      }
+    }
+    return RESPUESTA_LOCAL_YA_ENVIADA;
   }
 
   return null;
@@ -1950,6 +2275,16 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
         estado,
         mensajeSeguimientoTrasFuzzy(estado, confFuzzy.propuesta)
       );
+      if (confFuzzy.propuesta?.tipo === "promo") {
+        const promos = obtenerPromosVigentes();
+        const p =
+          promos.find((x) => x.id === confFuzzy.propuesta.promoId) ||
+          promos.find((x) => (x.titulo || x.id) === confFuzzy.propuesta.titulo) ||
+          promos[0];
+        if (p && promoImagenes.promoTieneImagen(p)) {
+          await promoImagenes.enviarUnaImagen(sock, from, p.imagenUrl, `🔥 ${p.titulo || "Promo"}`);
+        }
+      }
       return;
     }
   }
@@ -1971,8 +2306,13 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   }
 
   if (estado.pasoPedido === "G" && esAfirmacionSimple(textoClean)) {
-    await confirmarPedidoYPasarAHumano(sock, from, estado, quien);
+    estado.pasoPedido = "H";
+    await sendText(sock, from, estado, pagoCarly.cfg().textoPreguntaMetodo);
     return;
+  }
+
+  if (estado.pasoPedido === "H" || estado.pasoPedido === "I") {
+    if (await manejarPasoPagoPedido(sock, from, estado, quien, textoClean)) return;
   }
 
   const respRebanadas = responderConsultaRebanadas(textoClean);
@@ -1988,6 +2328,16 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     textoClean,
     texto
   );
+  if (respLocal === RESPUESTA_LOCAL_YA_ENVIADA) {
+    if (estado.escalarTrasRespuesta) {
+      estado.escalarTrasRespuesta = false;
+      await activarModoHumano(sock, from, estado, quien, textoClean || texto, {
+        skipMensajeCliente: false
+      });
+    }
+    return;
+  }
+
   if (respLocal) {
     await sendText(sock, from, estado, respLocal);
     if (estado.escalarTrasRespuesta) {
@@ -2059,8 +2409,10 @@ async function confirmarPedidoYPasarAHumano(sock, from, estado, quien) {
       ? estado.direccionCompleta ||
         [estado.dirCalle, estado.dirEntre, estado.dirReferencia].filter(Boolean).join(" | ")
       : "Recoger en tienda";
+  const lineaPago = pagoCarly.textoResumenPagoEnPedido(estado, total);
+  const bloquePago = lineaPago ? `\n${lineaPago}` : "";
 
-  const payload = `🍕 *PEDIDO — PASAR A COLABORADOR*\n\n📞 ${quien}\nJID: ${from}\n📍 ${dir}\n\n${resumen || "—"}\n💰 Total: $${total}`;
+  const payload = `🍕 *PEDIDO — PASAR A COLABORADOR*\n\n📞 ${quien}\nJID: ${from}\n📍 ${dir}\n\n${resumen || "—"}\n💰 Total: $${total}${bloquePago}`;
 
   try {
     const telefono = String(from || "").replace(/@.+$/, "");
@@ -2076,6 +2428,7 @@ Cliente: ${from}
 Pedido: ${resumen}
 Dirección: ${dir}
 Total: $${total}
+Pago: ${lineaPago || "—"}
 Fecha: ${new Date().toLocaleString()}
 `;
     await registrarPedidoEnStorage(pedidoGuardar);
@@ -2497,7 +2850,9 @@ function nuevoEstadoCliente() {
     subPasoDireccion: null,
     pizzaSugerida: null,
     pendienteEnvioConfirmacion: false,
-    confirmacionPendiente: null
+    confirmacionPendiente: null,
+    formaPago: null,
+    pagoCon: null
   };
 }
 
@@ -3135,13 +3490,21 @@ function listaTriggersCsv(s) {
     .filter(Boolean);
 }
 
+function obtenerFaqsEfectivas() {
+  const base = restaurante?.faqs || [];
+  const extra = botConfigStore.getConfig().faqsExtras || [];
+  return [...base, ...extra];
+}
+
+function triggersDeFaq(f) {
+  return [...listaTriggersCsv(f?.triggers), ...listaTriggersCsv(f?.aliases)];
+}
+
 function buscarRespuestaFaq(t) {
   const x = sinAcentos(normalizarTextoPedido(t));
-  const faqs = restaurante?.faqs || [];
-  for (const f of faqs) {
-    const triggers = listaTriggersCsv(f.triggers);
-    for (const tr of triggers) {
-      if (tr && x.includes(tr)) return f.respuesta ?? f.resuesta ?? null;
+  for (const f of obtenerFaqsEfectivas()) {
+    for (const tr of triggersDeFaq(f)) {
+      if (tr && x.includes(tr)) return f.respuesta ?? null;
     }
   }
   return null;
@@ -3164,7 +3527,9 @@ function responderServicioHorarioPromoCombo(t) {
     );
   }
   if (/(promo|promocion|oferta)/.test(x)) partes.push(`🔥 Promos: ${restaurante.promocionesTexto}`);
-  if (/(combo|paquete)/.test(x)) partes.push(`🧺 Combos: ${restaurante.combosTexto}`);
+  if (/(combo|paquete)/.test(x) && !/\b(promos?|promocion|ofertas?)\b/.test(x)) {
+    partes.push(textoListaCombosVigentes());
+  }
   if (!partes.length) return null;
   return partes.join("\n\n");
 }
@@ -3795,9 +4160,7 @@ async function aplicarPostEleccionSalsa(sock, from, estado, quien) {
       estado.tempComplemento = sig.nombre;
       estado.tempCantidadPre = sig.cantidad;
       estado.paso = "elegir_salsa_complemento";
-      await sock.sendMessage(from, {
-        text: textoMenuSalsasAlitas()
-      });
+      await enviarMenuSalsasAlCliente(sock, from, estado);
       return;
     }
 
@@ -3863,6 +4226,8 @@ async function startBot() {
   descripcionesMap = await cargarDescripciones();
   rebuildDetectCache();
   initFuzzyCarly();
+  initPagoCarly();
+  initConsultasCarly();
   initCarlyIntents();
   initGroqCarlyLite();
   inicializarRestauranteCache();
@@ -3914,7 +4279,14 @@ async function startBot() {
     textoAliasList: textoAliasListadoPanel,
     aliasAddAprendido: aliasPanelAddAprendido,
     aliasAddManual: aliasPanelAddManual,
-    aliasDel: aliasPanelDel
+    aliasDel: aliasPanelDel,
+    textoConsultaList: () => consultasCarly.textoListadoConsultas(),
+    consultaAdd: consultaPanelAdd,
+    consultaManual: consultaPanelManual,
+    consultaDel: consultaPanelDel,
+    textoFaqList: textoFaqListadoPanel,
+    faqAdd: faqPanelAdd,
+    faqDel: faqPanelDel
   });
   const { state, saveCreds } = await useFirestoreAuthState();
 

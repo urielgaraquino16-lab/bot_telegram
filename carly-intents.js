@@ -11,6 +11,8 @@ const ORDEN_RESPUESTA = [
   "horario",
   "domicilio",
   "promo",
+  "combo",
+  "salsas_alitas",
   "rebanadas",
   "ingredientes",
   "mitad_precio",
@@ -40,7 +42,9 @@ function detectarIntenciones(textoClean, estado) {
   if (/(domicilio|reparto|entrega|envio|envío|a domicilio|a casa)/.test(t)) {
     found.add("domicilio");
   }
-  if (/(promo|promocion|oferta|combo)/.test(t)) found.add("promo");
+  if (/(promo|promocion|oferta)/.test(t)) found.add("promo");
+  if (/\b(combos?|paquetes?)\b/.test(t)) found.add("combo");
+  if (deps.esConsultaMenuSalsasAlitas?.(t)) found.add("salsas_alitas");
   if (deps.esPreguntaRebanadas?.(t)) found.add("rebanadas");
   if (deps.esPreguntaIngredientesPizza?.(t)) found.add("ingredientes");
   if (/(mitad\s*y\s*mitad|media\s*y\s*media|dos\s*sabores)/.test(t)) {
@@ -222,6 +226,14 @@ function planificarRespuesta(analisis, estado, textoClean) {
     if (key === "horario") bloques.push(bloqueHorario());
     if (key === "domicilio") bloques.push(bloqueDomicilio());
     if (key === "promo") bloques.push(bloquePromos());
+    if (key === "combo") {
+      const r = deps.textoListaCombosVigentes?.();
+      if (r) bloques.push(r);
+    }
+    if (key === "salsas_alitas") {
+      const r = deps.textoMenuSalsasAlitas?.();
+      if (r) bloques.push(r);
+    }
     if (key === "rebanadas") {
       const r = deps.responderConsultaRebanadas?.(textoClean);
       if (r) bloques.push(r);

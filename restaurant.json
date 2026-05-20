@@ -1,5 +1,7 @@
 {
   "nombreNegocio": "Pizzas Carly",
+  "imagenesPromosAyuda": "Firebase Storage: promos → imagenUrl en cada promo; alitas/salsas → alitasBonelessSalsas.imagenUrl; combos → combosImagenGeneralUrl (+ imagenUrl en combos del día). URL con ?alt=media&token=...",
+  "consultasAyuda": "consultasAliases: typos → accion (horario, domicilio, pago_transferencia…). FAQs en faqs[] o Telegram /faq add. Sabores: ingredientAliases y /alias.",
   "mensajeEscaladoCliente": "😊 En un momentito te atiende alguien del equipo para ayudarte mejor 🍕\n¡Gracias por tu paciencia!",
   "mensajeFallbackSinGroq": "",
   "horarioTexto": "Lunes a domingo 12:00 PM a 10:30 PM",
@@ -36,11 +38,29 @@
     "mexicana": "mexico, mexicano",
     "pastor": "trompo, al pastor, alpastor"
   },
+  "consultasAliases": {
+    "horario": "que orario tiene, q horario, a que hora abren, a que hora cierran, horarios",
+    "domicilio": "tienen serbisio, servisio a domicilio, hacen envio, reparten, mandan a casa",
+    "servicio": "tienen servicio, hay servicio, servicio a domicilio",
+    "pago_transferencia": "tranferencia, transfermcia, transferir, pago por transferencia, pago pot tasferencia, aceptan transferencia, datos de cuenta, clabe",
+    "pago_tarjeta": "acetan targeta, aceptan targeta, aceptan tarjeta, tarjeta de credito, terminal",
+    "pago_factura": "facturan, factura, facturacion, cfdi",
+    "pago_formas": "formas de pago, como pago, metodos de pago",
+    "promos": "promociones del dia, que promos hay, ofertas de hoy",
+    "combos": "que combos hay, paquetes, combos del dia",
+    "salsas": "salsas alitas, lista de salsas, que salsas tienen, alista bbq, bonele, bonless, boneless"
+  },
+  "formasPago": {
+    "textoEfectivoTransferencia": "💳 Aceptamos *efectivo* y *transferencia*.",
+    "textoNoTarjeta": "💳 No manejamos tarjeta; solo *efectivo* y *transferencia*.",
+    "textoNoFactura": "📄 No facturamos. El pago es *efectivo* o *transferencia*.",
+    "textoSiTransferencia": "✅ Sí, puedes pagar por *transferencia*. Te mando los datos de cuenta 👇",
+    "textoTransferenciaPedido": "✅ Transfiere y guarda tu comprobante; en un momento el equipo confirma tu pedido 🍕",
+    "textoPreguntaMetodo": "💳 ¿Tu pago será *efectivo* o *transferencia*?",
+    "textoPreguntaEfectivoMonto": "💵 ¿Con cuánto vas a pagar? (solo el número, ej. 500)",
+    "cuentasImagenUrls": []
+  },
   "faqs": [
-    {
-      "triggers": "formas de pago, como pago,no aceptan tarjeta, efectivo, transferencia",
-      "respuesta": "💳 Aceptamos efectivo y transferencia; tarjeta según disponibilidad en tienda. Si necesitas factura o cargo con terminal, te conecto con un asesor."
-    },
     {
       "triggers": "tiempo de entrega, cuanto tardan, demora",
       "respuesta": "⏱ Normalmente 30–40 min según zona y carga del día; se te confirma al salir."

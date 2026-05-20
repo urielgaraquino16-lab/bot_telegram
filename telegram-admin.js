@@ -83,6 +83,17 @@ function textoHelp() {
 /alias del typo
 /alias manual typo → canonico (ingredientAliases)
 
+*Consultas (typos → respuesta automática)*
+/consulta — acciones y ayuda
+/consulta add typo → horario
+/consulta manual horario → q orario, a q hora abren
+/consulta del typo
+
+*FAQs (respuesta tuya, texto libre)*
+/faq list — ver todas
+/faq add palabras clave | Tu respuesta
+/faq del N — borrar FAQ del panel (N = número en /faq list)
+
 *Otros*
 /status — resumen
 /nota — ver instrucciones extra para Carly
@@ -223,6 +234,34 @@ async function manejarComando(texto, chatId) {
   const mDel = line.match(/^\/alias\s+del\s+(.+)$/i);
   if (mDel) {
     return deps.aliasDel(mDel[1].trim());
+  }
+
+  if (low === "/consulta" || low === "/consulta list") {
+    return deps.textoConsultaList ? deps.textoConsultaList() : "Consultas no configuradas.";
+  }
+  const mConsAdd = line.match(/^\/consulta\s+add\s+(.+?)\s*→\s*(.+)$/i);
+  if (mConsAdd) {
+    return deps.consultaAdd(mConsAdd[1].trim(), mConsAdd[2].trim());
+  }
+  const mConsMan = line.match(/^\/consulta\s+manual\s+(\S+)\s*→\s*(.+)$/i);
+  if (mConsMan) {
+    return deps.consultaManual(mConsMan[1].trim(), mConsMan[2].trim());
+  }
+  const mConsDel = line.match(/^\/consulta\s+del\s+(.+)$/i);
+  if (mConsDel) {
+    return deps.consultaDel(mConsDel[1].trim());
+  }
+
+  if (low === "/faq" || low === "/faq list") {
+    return deps.textoFaqList ? deps.textoFaqList() : "FAQs no configuradas.";
+  }
+  const mFaqAdd = line.match(/^\/faq\s+add\s+(.+?)\s*\|\s*(.+)$/i);
+  if (mFaqAdd) {
+    return deps.faqAdd(mFaqAdd[1].trim(), mFaqAdd[2].trim());
+  }
+  const mFaqDel = line.match(/^\/faq\s+del\s+(\d+)$/i);
+  if (mFaqDel) {
+    return deps.faqDel(mFaqDel[1].trim());
   }
 
   return "❓ Comando no reconocido. Escribe /help";
