@@ -15,6 +15,19 @@
     "permitido": true,
     "notaPrecio": "Puedes pedir mitad y mitad de pizza"
   },
+  "rebanadasPorTamano": {
+    "mediana": 8,
+    "grande": 10,
+    "familiar": 12,
+    "jumbo": 20,
+    "mega": 40
+  },
+  "aliasesAprendidos": {},
+  "fuzzy": {
+    "umbralAlto": 0.88,
+    "umbralMedio": 0.72,
+    "minVecesSiParaAviso": 5
+  },
   "ingredientAliases": {
     "peperoni": "pepperoni, peperonni, peperony, pepperonni",
     "hawaiana": "hawai, hawaianna, jamón con piña, jamon con piña, piña",

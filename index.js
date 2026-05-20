@@ -22,6 +22,7 @@ const axios = require("axios");
 
 const XLSX = require("xlsx");
 const fsp = fs.promises;
+const fuzzyCarly = require("./fuzzy-carly");
 
 // Firestore (opcional). Si falta clave.json o falla la inicialización, el bot
 // sigue funcionando con persistencia local.
@@ -277,6 +278,13 @@ function defaultRestaurante() {
       permitido: true,
       notaPrecio: "Mitad y mitad se cobra al precio del sabor más caro en ese tamaño."
     },
+    rebanadasPorTamano: {
+      mediana: 8,
+      grande: 10,
+      familiar: 12,
+      jumbo: 20,
+      mega: 40
+    },
     ingredientAliases: {},
     faqs: [],
     extras: [],
@@ -303,7 +311,9 @@ function defaultRestaurante() {
         "🥤 *Recuerda:* tu pizza *grande o mayor incluye refresco GRATIS*, _recuerda no aplica con otras promociones_.",
       mensajeSiNoHayTamano:
         "🥤 Si pediste pizza *grande o mayor*, puede aplicar *refresco gratis* según promo. *Conserva este chat* por si hace falta aclararlo en entrega."
-    }
+    },
+    aliasesAprendidos: {},
+    fuzzy: { umbralAlto: 0.88, umbralMedio: 0.72, minVecesSiParaAviso: 5 }
   };
 }
 
@@ -316,6 +326,10 @@ function cargarRestaurante() {
       ...def,
       ...parsed,
       mitadMitad: { ...def.mitadMitad, ...(parsed.mitadMitad || {}) },
+      rebanadasPorTamano: {
+        ...def.rebanadasPorTamano,
+        ...(parsed.rebanadasPorTamano || {})
+      },
       escalamientoHumano: {
         ...def.escalamientoHumano,
         ...(parsed.escalamientoHumano || {})
@@ -338,7 +352,12 @@ function cargarRestaurante() {
       recordatorioRefrescoGratis: {
         ...def.recordatorioRefrescoGratis,
         ...(parsed.recordatorioRefrescoGratis || {})
-      }
+      },
+      aliasesAprendidos: {
+        ...def.aliasesAprendidos,
+        ...(parsed.aliasesAprendidos || {})
+      },
+      fuzzy: { ...def.fuzzy, ...(parsed.fuzzy || {}) }
     };
   } catch {
     return defaultRestaurante();
@@ -371,6 +390,7 @@ async function recargarRestauranteSiCambioAsync() {
       restauranteMtimeMs = mtimeMs;
       restaurante = cargarRestaurante();
       rebuildDetectCache();
+      if (typeof initFuzzyCarly === "function") initFuzzyCarly();
       console.log("✅ restaurant.json recargado");
     }
   } catch {
@@ -1214,6 +1234,9 @@ ${construirTextoComplementosParaPrompt()}
 PROMOCIONES DE HOY (hora México; solo estas aplican hoy):
 ${construirTextoPromosParaPrompt()}
 
+REBANADAS POR TAMAÑO (dato oficial):
+${textoRebanadasParaPrompt()}
+
 ESTADO ACTUAL DEL CLIENTE:
 ${serializarEstadoCliente(estado)}
 
@@ -1221,6 +1244,7 @@ REGLAS:
 - Si el cliente quiere hacer un pedido, guíalo paso a paso: primero pizza, luego tamaño, luego complementos, luego dirección.
 - Si preguntan ingredientes, responde directo.
 - Si preguntan precio, responde directo.
+- Si preguntan rebanadas o porciones por tamaño, usa REBANADAS POR TAMAÑO.
 - Si preguntan promociones, ofertas o combos del día, responde solo con PROMOCIONES DE HOY (no inventes otras).
 - Si no puedes ayudar, responde exactamente: ESCALAR
 - Nunca inventes precios ni ingredientes.
@@ -1260,6 +1284,168 @@ function detectarInicioPedido(textoClean) {
   );
 }
 
+function detectarCantidadEnTexto(textoClean) {
+  const m = String(textoClean || "").match(/\b(\d{1,2})\b/);
+  if (m) return Number.parseInt(m[1], 10);
+  const map = { un: 1, una: 1, dos: 2, tres: 3, cuatro: 4, cinco: 5, seis: 6 };
+  for (const [w, n] of Object.entries(map)) {
+    if (new RegExp(`\\b${w}\\b`).test(textoClean)) return n;
+  }
+  return null;
+}
+
+function textoPreciosTamanoParaPizza(pizzaKey) {
+  const por = menu[pizzaKey];
+  if (!por) return TEXTO_MENU_TAMANOS;
+  const filas = [
+    ["1️⃣", "mediana"],
+    ["2️⃣", "grande"],
+    ["3️⃣", "familiar"],
+    ["4️⃣", "jumbo"],
+    ["5️⃣", "mega"]
+  ];
+  const lineas = ["📏 ¿Qué tamaño quieres?"];
+  for (const [emoji, tam] of filas) {
+    if (por[tam] != null) lineas.push(`${emoji} ${capitalizar(tam)} — $${por[tam]}`);
+  }
+  return lineas.join("\n");
+}
+
+function mensajeSeguimientoTrasFuzzy(estado, propuesta) {
+  if (!propuesta) return "✅ Listo. ¿Qué más te gustaría? 🍕";
+  if (propuesta.tipo === "mitad_mitad") {
+    const [a, b] = propuesta.ingredientes || [];
+    if (estado.tamano) {
+      return `✅ Mitad *${capitalizar(a)}* y mitad *${capitalizar(b)}* (${estado.tamano}).\n¿Llevas complementos o bebidas? 🍟🥤`;
+    }
+    return `✅ Mitad *${capitalizar(a)}* y mitad *${capitalizar(b)}*.\n\n${textoPreciosTamanoParaPizza(a)}`;
+  }
+  if (propuesta.tipo === "pizza") {
+    const p = propuesta.ingredientes?.[0];
+    if (estado.tamano) {
+      return `✅ Pizza *${capitalizar(p)}* (${estado.tamano}).\n¿Extras (orilla de queso, masa delgada) o pasamos a complementos? 🍕`;
+    }
+    return `✅ Pizza *${capitalizar(p)}*.\n\n${textoPreciosTamanoParaPizza(p)}`;
+  }
+  if (propuesta.tipo === "comp" || propuesta.tipo === "bebida") {
+    return `✅ Agregué *${capitalizar(propuesta.nombre)}*${propuesta.cantidad > 1 ? ` x${propuesta.cantidad}` : ""}.\n¿Algo más? 🍕`;
+  }
+  if (propuesta.tipo === "promo") {
+    const promos = obtenerPromosVigentes();
+    const p = promos.find((x) => x.id === propuesta.promoId) || promos[0];
+    if (p) {
+      return `✅ Promo *${propuesta.titulo}*:\n${formatearTextoPromoCliente(p)}\n\n¿Quieres armar tu pedido con esta promo? 🍕`;
+    }
+    return `✅ Tomé nota de la promo *${propuesta.titulo}*. ¿Qué pizza o combo te gustaría? 🔥`;
+  }
+  if (propuesta.tipo === "extra") {
+    recalcularExtrasTotal(estado);
+    const exLineas = (estado.extrasLineas || []).join(", ");
+    return `✅ Extras: ${exLineas || propuesta.nombre}.\n¿Seguimos con complementos o bebidas? 🍕`;
+  }
+  return "✅ Listo. ¿Qué más te gustaría? 🍕";
+}
+
+function registrarAprendizajeAsync(entry) {
+  fuzzyCarly.registrarAprendizaje(entry).catch((err) => {
+    console.warn("aprendizaje:", err?.message || err);
+  });
+}
+
+async function guardarRestauranteAliases(aliases) {
+  const raw = await fsp.readFile("restaurant.json", "utf8");
+  const parsed = JSON.parse(raw);
+  parsed.aliasesAprendidos = aliases;
+  await fsp.writeFile("restaurant.json", JSON.stringify(parsed, null, 2) + "\n", "utf8");
+  restaurante.aliasesAprendidos = aliases;
+  try {
+    const st = await fsp.stat("restaurant.json");
+    restauranteMtimeMs = st.mtimeMs || restauranteMtimeMs;
+  } catch {
+    // ignorar
+  }
+}
+
+function initFuzzyCarly() {
+  fuzzyCarly.init({
+    sinAcentos,
+    normalizarTextoPedido,
+    getMenu: () => menu,
+    getComplementosItems: () => complementosItems,
+    getBebidasItems: () => bebidasItems,
+    getRestaurante: () => restaurante,
+    obtenerPromosVigentes,
+    capitalizar,
+    detectarTamano,
+    esConsultaPrecio,
+    esPreguntaRebanadas,
+    esPreguntaIngredientesPizza,
+    detectarInicioPedido,
+    mergeExtrasEnEstado,
+    esAfirmacionSimple,
+    esNegacionSimple,
+    appendFile: (path, data) => fsp.appendFile(path, data, "utf8"),
+    guardarRestauranteAliases,
+    notificarTelegram: enviarTelegram,
+    registrarAprendizaje: (entry) => registrarAprendizajeAsync(entry)
+  });
+}
+
+async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto) {
+  const faq = buscarRespuestaFaq(textoClean);
+  if (faq) return faq;
+
+  const info = responderServicioHorarioPromoCombo(textoClean);
+  if (info) return info;
+
+  if (/(^hola$|^hola\s|buenas|buen dia|que tal|hey\b)/.test(textoClean) && !estado.pasoPedido) {
+    return `😊 ¡Hola! Soy *Carly* de *${restaurante.nombreNegocio || "Pizzas Carly"}* 🍕\n\nPuedo ayudarte con *precios*, *promos*, *ingredientes* o armar tu *pedido*.\n¿Qué te gustaría hoy?`;
+  }
+
+  if (textoPideVerCarrito(textoClean) && hayContenidoCarrito(estado)) {
+    return `🧺 *Tu pedido hasta ahora:*\n\n${resumenDetalladoPedidoParaCliente(estado)}`;
+  }
+
+  const edicion = aplicarEdicionCarritoNatural(estado, textoClean);
+  if (edicion) return edicion;
+
+  const precio = resolverConsultaPrecio(textoClean);
+  if (precio) return precio;
+
+  const descLocal = textoDescripcionLocalPizza(textoClean);
+  if (descLocal) return descLocal;
+
+  if (/(promo|promocion|oferta)\b/.test(textoClean) && !estado.pasoPedido) {
+    const promos = obtenerPromosVigentes();
+    if (!promos.length) {
+      return `🔥 ${restaurante.promocionesTexto || "Hoy no hay promos activas en el sistema."}`;
+    }
+    const lineas = promos.map((p, i) => {
+      const tit = p.titulo || p.id || `Promo ${i + 1}`;
+      return `*${i + 1}.* ${tit}\n${formatearTextoPromoCliente(p)}`;
+    });
+    return `🔥 *Promos de hoy:*\n\n${lineas.join("\n\n")}\n\n¿Cuál te interesa o qué pizza quieres? 🍕`;
+  }
+
+  const analisis = fuzzyCarly.analizarMensaje(textoClean, estado);
+  if (analisis.accion === "confirmar") {
+    estado.confirmacionPendiente = {
+      propuesta: analisis.propuesta,
+      textoOriginal: textoClean
+    };
+    return analisis.mensaje;
+  }
+  if (analisis.accion === "aplicar") {
+    fuzzyCarly.aplicarPropuesta(estado, analisis.propuesta);
+    if (!estado.pasoPedido && (analisis.propuesta.tipo === "pizza" || analisis.propuesta.tipo === "mitad_mitad")) {
+      estado.pasoPedido = estado.tamano ? "C" : "B";
+    }
+    return mensajeSeguimientoTrasFuzzy(estado, analisis.propuesta);
+  }
+
+  return null;
+}
+
 function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
   if (!textoClean) return;
 
@@ -1268,6 +1454,16 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
   }
 
   if (estado.pasoPedido === "A") {
+    if (estado.pizzaSugerida && esAfirmacionSimple(textoClean)) {
+      estado.ingredientes = [estado.pizzaSugerida];
+      estado.pizzaSugerida = null;
+      estado.pasoPedido = "B";
+      return;
+    }
+    if (estado.pizzaSugerida && esNegacionSimple(textoClean)) {
+      estado.pizzaSugerida = null;
+      return;
+    }
     const ings = detectarIngredientes(textoClean);
     if (ings.length) {
       const validos = ings.filter((i) => menu[i]);
@@ -1276,7 +1472,10 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
         estado.pizzaSugerida = null;
         estado.pasoPedido = "B";
       } else {
-        estado.pizzaSugerida = sugerirPizzaSimilar(textoClean);
+        const sug = sugerirPizzaSimilar(textoClean);
+        if (sug) {
+          estado.pizzaSugerida = sug;
+        }
       }
     }
     return;
@@ -1465,7 +1664,32 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     }
   }
 
+  const confFuzzy = fuzzyCarly.manejarConfirmacionPendiente(estado, textoClean);
+  if (confFuzzy.manejado) {
+    if (confFuzzy.mensaje) {
+      await sendText(sock, from, estado, confFuzzy.mensaje);
+      return;
+    }
+    if (confFuzzy.aplicado) {
+      await sendText(
+        sock,
+        from,
+        estado,
+        mensajeSeguimientoTrasFuzzy(estado, confFuzzy.propuesta)
+      );
+      return;
+    }
+  }
+
   actualizarEstadoDesdeMensaje(estado, texto, textoClean);
+
+  if (estado.pizzaSugerida && estado.pasoPedido === "A" && !estado.confirmacionPendiente) {
+    const prop = { tipo: "pizza", ingredientes: [estado.pizzaSugerida] };
+    estado.confirmacionPendiente = { propuesta: prop, textoOriginal: textoClean };
+    estado.pizzaSugerida = null;
+    await sendText(sock, from, estado, fuzzyCarly.textoConfirmacion(prop));
+    return;
+  }
 
   if (estado.pendienteEnvioConfirmacion && estado.pasoPedido === "G") {
     estado.pendienteEnvioConfirmacion = false;
@@ -1475,6 +1699,24 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
 
   if (estado.pasoPedido === "G" && esAfirmacionSimple(textoClean)) {
     await confirmarPedidoYPasarAHumano(sock, from, estado, quien);
+    return;
+  }
+
+  const respRebanadas = responderConsultaRebanadas(textoClean);
+  if (respRebanadas) {
+    await sendText(sock, from, estado, respRebanadas);
+    return;
+  }
+
+  const respLocal = await intentarRespuestaLocalCarly(
+    sock,
+    from,
+    estado,
+    textoClean,
+    texto
+  );
+  if (respLocal) {
+    await sendText(sock, from, estado, respLocal);
     return;
   }
 
@@ -1854,7 +2096,8 @@ function nuevoEstadoCliente() {
     direccionCompleta: null,
     subPasoDireccion: null,
     pizzaSugerida: null,
-    pendienteEnvioConfirmacion: false
+    pendienteEnvioConfirmacion: false,
+    confirmacionPendiente: null
   };
 }
 
@@ -2718,6 +2961,48 @@ function esPreguntaIngredientesPizza(textoClean) {
   );
 }
 
+function mapaRebanadasPorTamano() {
+  const m = restaurante?.rebanadasPorTamano;
+  if (!m || typeof m !== "object") {
+    return { mediana: 8, grande: 10, familiar: 12, jumbo: 20, mega: 40 };
+  }
+  return m;
+}
+
+function textoRebanadasParaPrompt() {
+  const map = mapaRebanadasPorTamano();
+  const orden = ["mediana", "grande", "familiar", "jumbo", "mega"];
+  return orden
+    .filter((t) => map[t] != null)
+    .map((t) => `- ${t}: ${map[t]} rebanadas`)
+    .join("\n");
+}
+
+function esPreguntaRebanadas(textoClean) {
+  const x = sinAcentos(normalizarTextoPedido(textoClean));
+  return (
+    /\b(rebanada|rebanadas|porcion|porciones|pedazo|pedazos|tajada|tajadas)\b/.test(x) ||
+    /\bcuantas?\s+.*(rebanada|porcion|pedazo)/.test(x) ||
+    /\b(trae|vienen|tiene)\s+.*(rebanada|porcion|pedazo)/.test(x) ||
+    /\bde\s+cuantas?\s+(rebanada|porcion)/.test(x)
+  );
+}
+
+function responderConsultaRebanadas(textoClean) {
+  if (!esPreguntaRebanadas(textoClean)) return null;
+  const map = mapaRebanadasPorTamano();
+  const orden = ["mediana", "grande", "familiar", "jumbo", "mega"];
+  const tam = detectarTamano(textoClean);
+  if (tam && map[tam] != null) {
+    return `🍕 La pizza *${tam}* trae *${map[tam]} rebanadas* 😊\n\n¿Te armo un pedido?`;
+  }
+  const lineas = orden
+    .filter((t) => map[t] != null)
+    .map((t) => `• *${capitalizar(t)}*: ${map[t]} rebanadas`);
+  if (!lineas.length) return null;
+  return `🍕 *Rebanadas por tamaño:*\n${lineas.join("\n")}\n\n¿Quieres ordenar? Dime sabor y tamaño 🍕😊`;
+}
+
 const PASOS_SIN_CONSULTA_DESCRIPCION = new Set([
   "cantidad_complemento",
   "agregar_mas",
@@ -3167,6 +3452,7 @@ async function startBot() {
   bebidasMenu = beb.menu;
   descripcionesMap = await cargarDescripciones();
   rebuildDetectCache();
+  initFuzzyCarly();
   inicializarRestauranteCache();
   const { state, saveCreds } = await useFirestoreAuthState();
 
