@@ -23,6 +23,8 @@ const axios = require("axios");
 const XLSX = require("xlsx");
 const fsp = fs.promises;
 const fuzzyCarly = require("./fuzzy-carly");
+const botConfigStore = require("./bot-config-store");
+const telegramAdmin = require("./telegram-admin");
 
 // Firestore (opcional). Si falta clave.json o falla la inicialización, el bot
 // sigue funcionando con persistencia local.
@@ -52,6 +54,21 @@ const MENSAJE_REACTIVACION_BOT =
 const PROCESANDO_MAX_MS = 45000;
 const MENSAJE_PASO_A_HUMANO =
   "🙌 ¡Perfecto! Ya te paso con alguien del equipo para cerrar tu pedido.\nEn un momentito te escriben 👋🍕";
+const MENSAJE_BOT_PAUSADO_CHAT =
+  "⏸ En este momento no tenemos el asistente automático activo.\nUn asesor te atenderá pronto. ¡Gracias! 🍕";
+const MENSAJE_BOT_PAUSADO_GLOBAL =
+  "⏸ Estamos atendiendo de forma manual por ahora.\nVuelve a escribir más tarde o llama al local. 🍕";
+const TELEGRAM_PANEL_ENABLED = process.env.TELEGRAM_PANEL !== "0";
+const TELEGRAM_ADMIN_IDS = process.env.TELEGRAM_ADMIN_IDS || "";
+
+function parseTelegramAdminIds(envVal) {
+  return new Set(
+    String(envVal || "")
+      .split(/[,;\s]+/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+  );
+}
 
 const USE_GROQ = !!(GroqCtor && GROQ_API_KEY);
 const groqClient = USE_GROQ ? new GroqCtor({ apiKey: GROQ_API_KEY }) : null;
@@ -429,8 +446,7 @@ async function recargarRestauranteSiCambioAsync() {
     if (mtimeMs && mtimeMs !== restauranteMtimeMs) {
       restauranteMtimeMs = mtimeMs;
       restaurante = cargarRestaurante();
-      rebuildDetectCache();
-      if (typeof initFuzzyCarly === "function") initFuzzyCarly();
+      aplicarBotConfigAMemoria(botConfigStore.getConfig());
       console.log("✅ restaurant.json recargado");
     }
   } catch {
@@ -1398,17 +1414,139 @@ function registrarAprendizajeAsync(entry) {
 }
 
 async function guardarRestauranteAliases(aliases) {
-  const raw = await fsp.readFile("restaurant.json", "utf8");
-  const parsed = JSON.parse(raw);
-  parsed.aliasesAprendidos = aliases;
-  await fsp.writeFile("restaurant.json", JSON.stringify(parsed, null, 2) + "\n", "utf8");
-  restaurante.aliasesAprendidos = aliases;
+  restaurante.aliasesAprendidos = { ...(aliases || {}) };
+  await botConfigStore.setAliasesAprendidos(restaurante.aliasesAprendidos);
   try {
+    const raw = await fsp.readFile("restaurant.json", "utf8");
+    const parsed = JSON.parse(raw);
+    parsed.aliasesAprendidos = restaurante.aliasesAprendidos;
+    await fsp.writeFile("restaurant.json", JSON.stringify(parsed, null, 2) + "\n", "utf8");
     const st = await fsp.stat("restaurant.json");
     restauranteMtimeMs = st.mtimeMs || restauranteMtimeMs;
   } catch {
-    // ignorar
+    // En Render el disco puede ser efímero; Firestore es la fuente de verdad.
   }
+  if (typeof initFuzzyCarly === "function") initFuzzyCarly();
+}
+
+function aplicarBotConfigAMemoria(cfg) {
+  const c = cfg || botConfigStore.getConfig();
+  if (c.aliasesAprendidos && Object.keys(c.aliasesAprendidos).length) {
+    restaurante.aliasesAprendidos = { ...c.aliasesAprendidos };
+  }
+  if (c.ingredientAliases && Object.keys(c.ingredientAliases).length) {
+    restaurante.ingredientAliases = {
+      ...(restaurante.ingredientAliases || {}),
+      ...c.ingredientAliases
+    };
+  }
+  rebuildDetectCache();
+  if (typeof initFuzzyCarly === "function") initFuzzyCarly();
+}
+
+function groqEstaActivo() {
+  if (!USE_GROQ || !groqClient) return false;
+  return botConfigStore.getConfig().groqActivo !== false;
+}
+
+function botAtiendeChat(jid) {
+  const cfg = botConfigStore.getConfig();
+  if (cfg.botActivoGlobal === false) return false;
+  if (cfg.chatsDesactivados && cfg.chatsDesactivados[jid]) return false;
+  return true;
+}
+
+function estaAbiertoEfectivo() {
+  const ov = botConfigStore.getConfig().overrideAbierto;
+  if (ov === true) return true;
+  if (ov === false) return false;
+  return estaAbierto();
+}
+
+function textoStatusPanelAdmin() {
+  const cfg = botConfigStore.getConfig();
+  const nAlias =
+    Object.keys(cfg.aliasesAprendidos || {}).length +
+    Object.keys(cfg.ingredientAliases || {}).length;
+  return (
+    `📊 *Estado Carly*\n\n` +
+    `Bot global: ${cfg.botActivoGlobal !== false ? "✅ ON" : "⏸ OFF"}\n` +
+    `Chats pausados: ${Object.keys(cfg.chatsDesactivados || {}).length}\n` +
+    `Groq: ${groqEstaActivo() ? "✅ ON" : "⏸ OFF"} (${GROQ_MODEL_NAME})\n` +
+    `Horario: ${estaAbiertoEfectivo() ? "🟢 abierto" : "🔴 cerrado"} (override: ${cfg.overrideAbierto == null ? "auto" : cfg.overrideAbierto})\n` +
+    `Menú Sheets: ${Object.keys(menu || {}).length} pizzas, ${complementosItems.length} comps\n` +
+    `Aliases config: ${nAlias}\n` +
+    `Firestore config: ${firestore ? "sí" : "no"}`
+  );
+}
+
+function textoAliasListadoPanel() {
+  const cfg = botConfigStore.getConfig();
+  const lines = [];
+  const ap = cfg.aliasesAprendidos || {};
+  const keys = Object.keys(ap);
+  if (keys.length) {
+    lines.push("*Aprendidos (Firestore):*");
+    for (const k of keys.slice(0, 25)) {
+      const v = ap[k];
+      lines.push(`• "${k}" → ${v?.canonico || "?"} (${v?.veces_si || 0}× sí)`);
+    }
+    if (keys.length > 25) lines.push(`… y ${keys.length - 25} más`);
+  }
+  const man = restaurante.ingredientAliases || {};
+  const mk = Object.keys(man);
+  if (mk.length) {
+    lines.push("\n*Manuales (ingredientAliases):*");
+    for (const k of mk.slice(0, 15)) {
+      lines.push(`• ${k} → ${man[k]}`);
+    }
+  }
+  return lines.length ? lines.join("\n") : "Sin aliases guardados.";
+}
+
+async function aliasPanelAddAprendido(typo, canonico) {
+  const t = sinAcentos(normalizarTextoPedido(typo));
+  const c = String(canonico || "").toLowerCase().trim();
+  if (!t || !c) return "❌ Uso: /alias add typo → canonico";
+  const cfg = botConfigStore.getConfig();
+  const ap = { ...(cfg.aliasesAprendidos || {}) };
+  ap[t] = { canonico: c, tipo: "pizza", veces_si: 1, veces_no: 0 };
+  restaurante.aliasesAprendidos = ap;
+  await botConfigStore.setAliasesAprendidos(ap);
+  initFuzzyCarly();
+  return `✅ Alias aprendido: "${t}" → *${c}*`;
+}
+
+async function aliasPanelAddManual(typo, canonico) {
+  const t = sinAcentos(normalizarTextoPedido(typo));
+  const c = String(canonico || "").toLowerCase().trim();
+  if (!t || !c) return "❌ Uso: /alias manual typo → canonico";
+  const cfg = botConfigStore.getConfig();
+  const man = { ...(cfg.ingredientAliases || {}), ...(restaurante.ingredientAliases || {}) };
+  const prev = String(man[c] || "");
+  man[c] = prev ? `${prev}, ${t}` : t;
+  restaurante.ingredientAliases = man;
+  await botConfigStore.setIngredientAliases(man);
+  rebuildDetectCache();
+  initFuzzyCarly();
+  return `✅ Manual: *${c}* incluye "${t}"`;
+}
+
+async function aliasPanelDel(typo) {
+  const t = sinAcentos(normalizarTextoPedido(typo));
+  const cfg = botConfigStore.getConfig();
+  const ap = { ...(cfg.aliasesAprendidos || {}) };
+  let hit = false;
+  if (ap[t]) {
+    delete ap[t];
+    hit = true;
+    await botConfigStore.setAliasesAprendidos(ap);
+    restaurante.aliasesAprendidos = ap;
+  }
+  initFuzzyCarly();
+  return hit
+    ? `✅ Eliminado alias aprendido "${t}"`
+    : `ℹ️ No estaba en aprendidos. Revisa /alias list`;
 }
 
 function initFuzzyCarly() {
@@ -1662,7 +1800,7 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     }
   }
 
-  if (!estaAbierto()) {
+  if (!estaAbiertoEfectivo()) {
     await sendText(sock, from, estado, MENSAJE_FUERA_HORARIO);
     return;
   }
@@ -1765,8 +1903,14 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     return;
   }
 
-  if (!USE_GROQ) {
-    await activarModoHumano(sock, from, estado, quien, "Groq no configurado");
+  if (!groqEstaActivo()) {
+    await activarModoHumano(
+      sock,
+      from,
+      estado,
+      quien,
+      USE_GROQ ? "Groq desactivado desde panel" : "Groq no configurado"
+    );
     return;
   }
 
@@ -1846,7 +1990,7 @@ const GROQ_TIMEOUT_SENTINEL = "__TIMEOUT__";
 const GROQ_MANEJADO_SENTINEL = "__GROQ_MANEJADO__";
 
 async function responderConGroqCarly(estado, pregunta, timeoutMs = GROQ_TIMEOUT_MS) {
-  if (!USE_GROQ || !groqClient) return "ESCALAR";
+  if (!groqEstaActivo()) return "ESCALAR";
 
   const system = construirSystemPromptCarly(estado);
   if (!Array.isArray(estado.historialGroq)) estado.historialGroq = [];
@@ -2797,7 +2941,7 @@ function responderServicioHorarioPromoCombo(t) {
   const partes = [];
   if (/(horario|abren|abre|cierran|cierra)/.test(x)) {
     partes.push(`🕒 Horario: ${restaurante.horarioTexto}`);
-    if (!estaAbierto()) {
+    if (!estaAbiertoEfectivo()) {
       partes.push("⏰ Ahorita estamos *cerrados* según este horario.");
     }
   }
@@ -2893,15 +3037,20 @@ function promoFechaVigente(p, hoyStr) {
 
 function obtenerPromosVigentes() {
   const list = restaurante.promociones;
-  if (!Array.isArray(list) || !list.length) return [];
+  const base = !Array.isArray(list) || !list.length ? [] : list;
   const dow = diaSemanaEnZonaHoraria();
   const hoyStr = diaLocalYyyyMmDdEnZonaHoraria();
-  return list.filter((p) => {
+  const filtradas = base.filter((p) => {
     if (!p || !promoFechaVigente(p, hoyStr)) return false;
     const dias = p.diasSemana;
     if (!Array.isArray(dias) || dias.length === 0) return true;
     return dias.includes(dow);
   });
+  const destacada = botConfigStore.getConfig().promoDestacada;
+  if (destacada?.activa) {
+    return [destacada, ...filtradas.filter((p) => p.id !== destacada.id)];
+  }
+  return filtradas;
 }
 
 function formatearTextoPromoCliente(p) {
@@ -3488,6 +3637,10 @@ async function aplicarPostEleccionSalsa(sock, from, estado, quien) {
 
 async function startBot() {
   const { useFirestoreAuthState } = require("./baileys-firestore-auth-state");
+  botConfigStore.init({ firestore });
+  await botConfigStore.loadFromFirestore();
+  aplicarBotConfigAMemoria(botConfigStore.getConfig());
+
   sheetsCache.clear();
   menu = await cargarMenu();
   const comp = await cargarComplementos();
@@ -3500,6 +3653,56 @@ async function startBot() {
   rebuildDetectCache();
   initFuzzyCarly();
   inicializarRestauranteCache();
+
+  telegramAdmin.start({
+    token: TELEGRAM_BOT_TOKEN,
+    enabled: TELEGRAM_PANEL_ENABLED && !!TELEGRAM_BOT_TOKEN,
+    adminUserIds: parseTelegramAdminIds(TELEGRAM_ADMIN_IDS),
+    fallbackChatId: String(TELEGRAM_CHAT_ID || ""),
+    getConfig: () => botConfigStore.getConfig(),
+    setConfig: async (partial) => {
+      await botConfigStore.savePartial(partial);
+      aplicarBotConfigAMemoria();
+    },
+    resolverJid: resolverJidClientePorNumero,
+    reactivarChat: (jid) => {
+      if (!estados[jid]) estados[jid] = nuevoEstadoCliente();
+      estados[jid].modoHumano = false;
+      estados[jid].tiempoEscalado = 0;
+    },
+    textoStatus: textoStatusPanelAdmin,
+    textoGroqStatus: () =>
+      `Groq env: ${USE_GROQ ? "✅ API key" : "❌ sin key"}\nPanel: ${botConfigStore.getConfig().groqActivo !== false ? "✅ ON" : "⏸ OFF"}\nActivo ahora: ${groqEstaActivo() ? "sí" : "no"}`,
+    textoBotStatus: () => {
+      const cfg = botConfigStore.getConfig();
+      const chats = Object.keys(cfg.chatsDesactivados || {});
+      return (
+        `Bot global: ${cfg.botActivoGlobal !== false ? "✅ ON" : "⏸ OFF"}\n` +
+        `Chats pausados (${chats.length}):\n` +
+        (chats.length ? chats.map((j) => `• ${j}`).join("\n") : "— ninguno")
+      );
+    },
+    textoAbiertoStatus: () => {
+      const cfg = botConfigStore.getConfig();
+      return (
+        `Horario JSON: ${restaurante.horarioTexto || "—"}\n` +
+        `Automático ahora: ${estaAbierto() ? "abierto" : "cerrado"}\n` +
+        `Efectivo (con override): ${estaAbiertoEfectivo() ? "abierto" : "cerrado"}\n` +
+        `Override panel: ${cfg.overrideAbierto == null ? "auto" : cfg.overrideAbierto}`
+      );
+    },
+    textoPromosHoy: () => {
+      const promos = obtenerPromosVigentes();
+      if (!promos.length) return "Hoy no hay promos en el sistema.";
+      return promos
+        .map((p, i) => `*${i + 1}.* ${p.titulo || p.id}\n${formatearTextoPromoCliente(p)}`)
+        .join("\n\n");
+    },
+    textoAliasList: textoAliasListadoPanel,
+    aliasAddAprendido: aliasPanelAddAprendido,
+    aliasAddManual: aliasPanelAddManual,
+    aliasDel: aliasPanelDel
+  });
   const { state, saveCreds } = await useFirestoreAuthState();
 
   const sock = makeWASocket({
@@ -3609,6 +3812,14 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
   estado.lastUserMessageAt = Date.now();
 
   if (await manejarComandoAdmin(sock, from, texto)) return;
+
+  if (!botAtiendeChat(from)) {
+    const cfg = botConfigStore.getConfig();
+    const pausa =
+      cfg.botActivoGlobal === false ? MENSAJE_BOT_PAUSADO_GLOBAL : MENSAJE_BOT_PAUSADO_CHAT;
+    await sendText(sock, from, estado, pausa);
+    return;
+  }
 
   const st = estados[from];
   if (!st) return;
