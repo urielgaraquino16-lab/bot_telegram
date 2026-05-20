@@ -89,6 +89,36 @@ function valorCeldaGviz(cell) {
   return cell.v;
 }
 
+/** Precios en Sheets pueden venir como número o "$65" / "65.00". */
+function parsearPrecioSheet(val) {
+  if (val == null || val === "") return NaN;
+  if (typeof val === "number" && Number.isFinite(val)) return val;
+  const s = String(val).replace(/[$,\s]/g, "");
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function filaPareceEncabezadosDeHoja(rowNorm) {
+  if (!rowNorm || typeof rowNorm !== "object") return false;
+  const pares = [
+    ["pizza", "pizza"],
+    ["tamano", "tamano"],
+    ["tamaño", "tamaño"],
+    ["precio", "precio"],
+    ["complementos", "complementos"],
+    ["complemento", "complemento"],
+    ["bebidas", "bebidas"],
+    ["bebida", "bebida"],
+    ["nombre", "nombre"]
+  ];
+  let hits = 0;
+  for (const [col, etiqueta] of pares) {
+    const v = rowNorm[col];
+    if (v != null && String(v).toLowerCase().trim() === etiqueta) hits++;
+  }
+  return hits >= 2;
+}
+
 /** Extrae JSON puro de la respuesta gviz (comentario O_o + setResponse). */
 function extraerJsonDeRespuestaGviz(texto) {
   let s = String(texto ?? "").trim();
@@ -110,8 +140,9 @@ function extraerJsonDeRespuestaGviz(texto) {
 }
 
 /**
- * Parsea respuesta gviz/tq. La primera fila de table.rows son headers (c[0].v, c[1].v…);
- * las siguientes filas son datos.
+ * Parsea respuesta gviz/tq.
+ * Usa los nombres de columna del Sheet (table.cols[].label), no la primera fila de datos.
+ * Antes se tomaba "papas a la francesa" / "65" como nombres de columna y fallaba el menú.
  */
 function parsearRespuestaGvizJson(texto) {
   const jsonText = extraerJsonDeRespuestaGviz(texto);
@@ -129,27 +160,36 @@ function parsearRespuestaGvizJson(texto) {
   const allRows = table?.rows;
   if (!Array.isArray(allRows) || allRows.length === 0) return [];
 
-  const headerCells = allRows[0]?.c || [];
-  const headers = headerCells.map((cell, i) => {
-    const fromCell = String(valorCeldaGviz(cell) || "")
-      .toLowerCase()
-      .trim();
-    if (fromCell) return fromCell;
+  const colCount = Math.max(
+    table?.cols?.length || 0,
+    ...allRows.map((r) => (r?.c || []).length)
+  );
+  const headers = [];
+  for (let i = 0; i < colCount; i++) {
     const fromCol = table.cols?.[i];
-    return String(fromCol?.label ?? fromCol?.id ?? `col${i}`)
+    const colLabel = String(fromCol?.label ?? fromCol?.id ?? "")
       .toLowerCase()
       .trim();
-  });
+    if (colLabel) {
+      headers.push(colLabel);
+      continue;
+    }
+    const fromCell = String(valorCeldaGviz(allRows[0]?.c?.[i]) || "")
+      .toLowerCase()
+      .trim();
+    headers.push(fromCell || `col${i}`);
+  }
 
-  const dataRows = allRows.slice(1);
-  return dataRows.map((row) => {
-    const obj = {};
-    (row.c || []).forEach((cell, i) => {
-      const key = headers[i] || `col${i}`;
-      obj[key] = valorCeldaGviz(cell);
-    });
-    return obj;
-  });
+  return allRows
+    .map((row) => {
+      const obj = {};
+      (row.c || []).forEach((cell, i) => {
+        const key = headers[i] || `col${i}`;
+        obj[key] = valorCeldaGviz(cell);
+      });
+      return obj;
+    })
+    .filter((row) => !filaPareceEncabezadosDeHoja(normalizarFilaGoogleSheet(row)));
 }
 
 async function obtenerFilasDeHojaGoogleSheetsGviz(sheetName) {
@@ -195,7 +235,7 @@ async function cargarMenu() {
       const tamanoRaw = r.tamaño ?? r.tamano ?? r["tamaño"];
       const tamaño =
         tamanoRaw != null ? String(tamanoRaw).toLowerCase().trim() : "";
-      const precio = Number(r.precio);
+      const precio = parsearPrecioSheet(r.precio);
       if (!pizza || !tamaño || Number.isNaN(precio)) return;
 
       if (!menu[pizza]) {
@@ -471,16 +511,11 @@ function capitalizar(s) {
 
 // 🍟 COMPLEMENTOS (desde Google Sheets, hoja "complementos")
 async function cargarComplementos() {
-  const fallbackItems = [
-    { nombre: "papas", precio: 50 },
-    { nombre: "alitas", precio: 90 },
-    { nombre: "boneless", precio: 100 }
-  ];
-
   const fallback = () => {
-    const menuFallback = {};
-    fallbackItems.forEach((c) => (menuFallback[c.nombre] = c.precio));
-    return { items: fallbackItems, menu: menuFallback };
+    console.warn(
+      "⚠️ complementos: no se leyó la hoja Sheets; revisa hoja 'complementos' y encabezados complementos|precio"
+    );
+    return { items: [], menu: {} };
   };
 
   try {
@@ -492,11 +527,11 @@ async function cargarComplementos() {
       const r = normalizarFilaGoogleSheet(row);
       const rawNombre =
         r.complementos ?? r.complemento ?? r.nombre ?? r.item;
-      const rawPrecio = r.precio;
+      const rawPrecio = r.precio ?? r.precios ?? r.costo;
       if (rawNombre == null) return;
 
       const nombre = String(rawNombre).toLowerCase().trim();
-      const precio = Number(rawPrecio);
+      const precio = parsearPrecioSheet(rawPrecio);
       if (!nombre || Number.isNaN(precio)) return;
 
       items.push({ nombre, precio });
@@ -504,8 +539,12 @@ async function cargarComplementos() {
     });
 
     if (items.length === 0) return fallback();
+    console.log(
+      `✅ complementos desde Sheets: ${items.length} ítems (ej. ${items[0]?.nombre} $${items[0]?.precio})`
+    );
     return { items, menu };
-  } catch {
+  } catch (err) {
+    console.warn("⚠️ cargarComplementos error:", err?.message || err);
     return fallback();
   }
 }
@@ -529,13 +568,19 @@ async function cargarBebidas() {
       const rawPrecio = r.precio;
       if (rawNombre == null) return;
       const nombre = String(rawNombre).toLowerCase().trim();
-      const precio = Number(rawPrecio);
+      const precio = parsearPrecioSheet(rawPrecio);
       if (!nombre || Number.isNaN(precio)) return;
       items.push({ nombre, precio });
       menuMap[nombre] = precio;
     });
+    if (items.length) {
+      console.log(
+        `✅ bebidas desde Sheets: ${items.length} ítems (ej. ${items[0]?.nombre} $${items[0]?.precio})`
+      );
+    }
     return items.length ? { items, menu: menuMap } : fallback;
-  } catch {
+  } catch (err) {
+    console.warn("⚠️ cargarBebidas error:", err?.message || err);
     return fallback;
   }
 }
@@ -3443,6 +3488,7 @@ async function aplicarPostEleccionSalsa(sock, from, estado, quien) {
 
 async function startBot() {
   const { useFirestoreAuthState } = require("./baileys-firestore-auth-state");
+  sheetsCache.clear();
   menu = await cargarMenu();
   const comp = await cargarComplementos();
   complementosItems = comp.items;
