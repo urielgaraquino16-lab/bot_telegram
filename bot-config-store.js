@@ -14,6 +14,7 @@ const DEFAULT_CONFIG = {
   aliasesAprendidos: {},
   ingredientAliases: {},
   promoDestacada: null,
+  instruccionesCarly: "",
   updatedAt: null
 };
 

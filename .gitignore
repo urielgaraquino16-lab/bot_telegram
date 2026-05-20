@@ -4,5 +4,7 @@ firebase-b64.txt
 temp.txt
 pedidos.txt
 metricas.jsonl
+aprendizaje_aliases.jsonl
+aprendizaje_intents.jsonl
 menu.xlsx
 auth/

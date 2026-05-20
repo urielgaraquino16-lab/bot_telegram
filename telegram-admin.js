@@ -85,6 +85,9 @@ function textoHelp() {
 
 *Otros*
 /status — resumen
+/nota — ver instrucciones extra para Carly
+/nota texto — personalidad o reglas (Firestore, sin código)
+
 /help — esta ayuda`;
 }
 
@@ -192,6 +195,18 @@ async function manejarComando(texto, chatId) {
       }
     });
     return `✅ Promo destacada guardada:\n*${titulo}*\n${textoCliente}`;
+  }
+
+  if (low === "/nota" || low === "/nota status") {
+    const n = String(cfg.instruccionesCarly || "").trim();
+    return n
+      ? `📝 *Instrucciones Carly:*\n${n}`
+      : "📝 Sin instrucciones extra. Usa:\n/nota Eres breve y siempre ofrece promos del día";
+  }
+  const mNota = line.match(/^\/nota\s+(.+)$/i);
+  if (mNota) {
+    await deps.setConfig({ instruccionesCarly: mNota[1].trim() });
+    return "✅ Instrucciones guardadas (Groq lite las usará, sin tocar el menú).";
   }
 
   if (low === "/alias" || low === "/alias list") {

@@ -1,5 +1,7 @@
 {
   "nombreNegocio": "Pizzas Carly",
+  "mensajeEscaladoCliente": "😊 En un momentito te atiende alguien del equipo para ayudarte mejor 🍕\n¡Gracias por tu paciencia!",
+  "mensajeFallbackSinGroq": "",
   "horarioTexto": "Lunes a domingo 12:00 PM a 10:30 PM",
   "horarioAbierto": {
     "inicio": "12:00",

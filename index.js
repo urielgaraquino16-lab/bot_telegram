@@ -25,6 +25,8 @@ const fsp = fs.promises;
 const fuzzyCarly = require("./fuzzy-carly");
 const botConfigStore = require("./bot-config-store");
 const telegramAdmin = require("./telegram-admin");
+const carlyIntents = require("./carly-intents");
+const groqCarlyLite = require("./groq-carly-lite");
 
 // Firestore (opcional). Si falta clave.json o falla la inicialización, el bot
 // sigue funcionando con persistencia local.
@@ -45,6 +47,7 @@ try {
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL_NAME = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const GROQ_LITE_MODE = process.env.GROQ_LITE !== "0";
 
 const MODO_HUMANO_TTL_MS = 30 * 60 * 1000;
 const MENSAJE_FUERA_HORARIO =
@@ -58,6 +61,11 @@ const MENSAJE_BOT_PAUSADO_CHAT =
   "⏸ En este momento no tenemos el asistente automático activo.\nUn asesor te atenderá pronto. ¡Gracias! 🍕";
 const MENSAJE_BOT_PAUSADO_GLOBAL =
   "⏸ Estamos atendiendo de forma manual por ahora.\nVuelve a escribir más tarde o llama al local. 🍕";
+const MENSAJE_ESCALADO_CLIENTE_DEFAULT =
+  "😊 En un momentito te atiende alguien del equipo para ayudarte mejor 🍕\n¡Gracias por tu paciencia!";
+const MENSAJE_FALLBACK_SIN_GROQ_DEFAULT =
+  "😊 Puedo ayudarte así:\n• *Promos* — promociones del día\n• *Precio* — ej. *hawaiana grande*\n• *Pedido* — sabor + tamaño (ej. *peperoni familiar*)\n• *Horario* o *domicilio*\n\nEscribe lo que necesites 🍕";
+const GROQ_RATE_LIMIT_SENTINEL = "__RATE_LIMIT__";
 const TELEGRAM_PANEL_ENABLED = process.env.TELEGRAM_PANEL !== "0";
 const TELEGRAM_ADMIN_IDS = process.env.TELEGRAM_ADMIN_IDS || "";
 
@@ -73,7 +81,9 @@ function parseTelegramAdminIds(envVal) {
 const USE_GROQ = !!(GroqCtor && GROQ_API_KEY);
 const groqClient = USE_GROQ ? new GroqCtor({ apiKey: GROQ_API_KEY }) : null;
 if (USE_GROQ) {
-  console.log(`🤖 Groq activo (modelo: ${GROQ_MODEL_NAME})`);
+  console.log(
+    `🤖 Groq activo (modelo: ${GROQ_MODEL_NAME}, modo: ${GROQ_LITE_MODE ? "lite" : "completo"})`
+  );
 } else {
   console.log("🤖 Groq inactivo (configura GROQ_API_KEY e instala el paquete groq)");
 }
@@ -447,6 +457,7 @@ async function recargarRestauranteSiCambioAsync() {
       restauranteMtimeMs = mtimeMs;
       restaurante = cargarRestaurante();
       aplicarBotConfigAMemoria(botConfigStore.getConfig());
+      initCarlyIntents();
       console.log("✅ restaurant.json recargado");
     }
   } catch {
@@ -1549,6 +1560,40 @@ async function aliasPanelDel(typo) {
     : `ℹ️ No estaba en aprendidos. Revisa /alias list`;
 }
 
+function registrarAprendizajeIntentsAsync(entry) {
+  const row = { ts: new Date().toISOString(), ...entry };
+  return fsp.appendFile("aprendizaje_intents.jsonl", JSON.stringify(row) + "\n", "utf8").catch(() => {});
+}
+
+function initCarlyIntents() {
+  carlyIntents.init({
+    sinAcentos,
+    normalizarTextoPedido,
+    getMenu: () => menu,
+    getRestaurante: () => restaurante,
+    detectarIngredientes,
+    detectarTamano,
+    detectarComplementosEnTexto,
+    detectarBebidasEnTexto,
+    detectarInicioPedido,
+    esConsultaPrecio,
+    esPreguntaRebanadas,
+    esPreguntaIngredientesPizza,
+    textoPideVerCarrito,
+    hayContenidoCarrito,
+    resolverConsultaPrecio,
+    responderConsultaRebanadas,
+    textoDescripcionLocalPizza,
+    obtenerPromosVigentes,
+    formatearTextoPromoCliente,
+    calcularPrecio,
+    capitalizar,
+    estaAbiertoEfectivo,
+    resumenDetalladoPedidoParaCliente,
+    appendLog: registrarAprendizajeIntentsAsync
+  });
+}
+
 function initFuzzyCarly() {
   fuzzyCarly.init({
     sinAcentos,
@@ -1577,6 +1622,18 @@ function initFuzzyCarly() {
 async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto) {
   const faq = buscarRespuestaFaq(textoClean);
   if (faq) return faq;
+
+  const multi = carlyIntents.intentarRespuestaMulti(textoClean, estado);
+  if (multi?.texto) {
+    carlyIntents.logInteraccion({
+      texto: textoClean,
+      intents: multi.intents,
+      escalar: !!multi.escalarHumano,
+      pasoPedido: estado.pasoPedido || null
+    });
+    if (multi.escalarHumano) estado.escalarTrasRespuesta = true;
+    return multi.texto;
+  }
 
   const info = responderServicioHorarioPromoCombo(textoClean);
   if (info) return info;
@@ -1751,6 +1808,39 @@ function marcarPasoConfirmacionPedido(estado) {
   estado.pendienteEnvioConfirmacion = true;
 }
 
+function mensajeEscaladoParaCliente() {
+  const custom = String(restaurante?.mensajeEscaladoCliente || "").trim();
+  return custom || MENSAJE_ESCALADO_CLIENTE_DEFAULT;
+}
+
+function respuestaFallbackSinGroq(estado, textoClean) {
+  const custom = String(restaurante?.mensajeFallbackSinGroq || "").trim();
+  if (custom) return custom;
+
+  const partes = [MENSAJE_FALLBACK_SIN_GROQ_DEFAULT];
+  const promos = obtenerPromosVigentes();
+  if (promos.length === 1) {
+    const p = promos[0];
+    partes.push(
+      `🔥 Hoy: *${p.titulo || "promo"}* — ${String(formatearTextoPromoCliente(p) || "").slice(0, 120)}`
+    );
+  }
+  if (estado?.pasoPedido && estado.pasoPedido !== "G") {
+    partes.push(
+      `📋 Sigues en pedido (paso ${estado.pasoPedido}). Escríbeme el dato que falta o *cancelar*.`
+    );
+  }
+  return partes.join("\n\n");
+}
+
+async function manejarFalloGroqOSinIA(sock, from, estado, quien, motivo = "") {
+  const fb = respuestaFallbackSinGroq(estado, motivo);
+  const escalado = mensajeEscaladoParaCliente();
+  const texto = fb ? `${escalado}\n\n${fb}` : escalado;
+  await sendText(sock, from, estado, texto);
+  await activarModoHumano(sock, from, estado, quien, motivo, { skipMensajeCliente: true });
+}
+
 function jidEsAdmin(jid) {
   if (!NUMERO_ADMIN || !jid) return false;
   const a = String(jid).split("@")[0].replace(/\D/g, "");
@@ -1900,11 +1990,17 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   );
   if (respLocal) {
     await sendText(sock, from, estado, respLocal);
+    if (estado.escalarTrasRespuesta) {
+      estado.escalarTrasRespuesta = false;
+      await activarModoHumano(sock, from, estado, quien, textoClean || texto, {
+        skipMensajeCliente: false
+      });
+    }
     return;
   }
 
   if (!groqEstaActivo()) {
-    await activarModoHumano(
+    await manejarFalloGroqOSinIA(
       sock,
       from,
       estado,
@@ -1914,20 +2010,39 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     return;
   }
 
-  const respuesta = await responderConGroqCarly(estado, textoClean || texto);
+  const ctxGroq = prepararContextoGroqLite(estado, textoClean);
+  if (ctxGroq.respuestaDirecta) {
+    await sendText(sock, from, estado, ctxGroq.respuestaDirecta);
+    return;
+  }
 
-  if (respuesta === GROQ_TIMEOUT_SENTINEL || !respuesta || /^ESCALAR\b/i.test(respuesta)) {
-    await activarModoHumano(sock, from, estado, quien, textoClean || texto);
+  const respuesta = await responderConGroqCarly(
+    estado,
+    textoClean || texto,
+    GROQ_TIMEOUT_MS,
+    ctxGroq.hechos
+  );
+
+  if (
+    respuesta === GROQ_TIMEOUT_SENTINEL ||
+    respuesta === GROQ_RATE_LIMIT_SENTINEL ||
+    !respuesta ||
+    /^ESCALAR\b/i.test(respuesta)
+  ) {
+    await manejarFalloGroqOSinIA(sock, from, estado, quien, textoClean || texto);
     return;
   }
 
   await sendText(sock, from, estado, respuesta);
 }
 
-async function activarModoHumano(sock, from, estado, quien, motivo = "") {
+async function activarModoHumano(sock, from, estado, quien, motivo = "", opts = {}) {
   estado.modoHumano = true;
   estado.tiempoEscalado = Date.now();
   const detalle = String(motivo || "").trim();
+  if (sock && from && estado && !opts.skipMensajeCliente) {
+    await sendText(sock, from, estado, mensajeEscaladoParaCliente());
+  }
   await notificarUrgenteMovil(sock, {
     waTitulo: "ESCALAR A ASESOR",
     waDetalle: `📞 ${quien}\nJID: ${from}${detalle ? `\n💬 ${detalle}` : ""}`,
@@ -1989,51 +2104,147 @@ const GROQ_INDICADOR_DELAY_MS = 2000;
 const GROQ_TIMEOUT_SENTINEL = "__TIMEOUT__";
 const GROQ_MANEJADO_SENTINEL = "__GROQ_MANEJADO__";
 
-async function responderConGroqCarly(estado, pregunta, timeoutMs = GROQ_TIMEOUT_MS) {
+function prepararContextoGroqLite(estado, textoClean) {
+  const hechos = [];
+  const nom = restaurante?.nombreNegocio || "Pizzas Carly";
+  hechos.push(`Negocio: ${nom}`);
+  hechos.push(`Abierto ahora: ${estaAbiertoEfectivo() ? "sí" : "no"}`);
+  if (restaurante?.horarioTexto) hechos.push(`Horario: ${restaurante.horarioTexto}`);
+
+  const estadoTxt = serializarEstadoCliente(estado);
+  if (estadoTxt && !estadoTxt.startsWith("- Cliente nuevo")) {
+    hechos.push(estadoTxt);
+  }
+
+  const { total } = subtotalesPedidoActuales(estado);
+  if (total > 0) hechos.push(`Total pedido en sistema: $${total}`);
+
+  const precioLocal = resolverConsultaPrecio(textoClean);
+  if (precioLocal) {
+    hechos.push(`PRECIO_VERIFICADO (copiar tal cual): ${precioLocal.replace(/\n+/g, " | ")}`);
+  }
+
+  const analisis = carlyIntents.detectarIntenciones(textoClean, estado);
+  if (analisis.intents?.length) {
+    hechos.push(`Intenciones detectadas: ${analisis.intents.join(", ")}`);
+  }
+  if (analisis.slots?.tamano) hechos.push(`Tamaño en mensaje: ${analisis.slots.tamano}`);
+  if (analisis.slots?.sabores?.length) {
+    hechos.push(`Sabores en mensaje: ${analisis.slots.sabores.join(", ")}`);
+  }
+
+  const promos = obtenerPromosVigentes().slice(0, 3);
+  if (promos.length) {
+    hechos.push(
+      `Promos hoy: ${promos.map((p) => p.titulo || p.id).join("; ")}`
+    );
+  }
+
+  const sabores = Object.keys(menu || {}).slice(0, 12);
+  if (sabores.length) {
+    hechos.push(`Ejemplos de sabores: ${sabores.join(", ")}`);
+  }
+
+  if (estado.pasoPedido === "B" && estado.ingredientes?.[0]) {
+    hechos.push(
+      `Precios tamaño para ${estado.ingredientes[0]}: ${textoPreciosTamanoParaPizza(estado.ingredientes[0]).replace(/\n+/g, " | ")}`
+    );
+  }
+
+  let respuestaDirecta = null;
+  if (
+    precioLocal &&
+    (!analisis.intents?.length ||
+      analisis.intents.every((i) =>
+        ["precio", "pedido", "saludo", "ingredientes", "rebanadas"].includes(i)
+      ))
+  ) {
+    respuestaDirecta = precioLocal;
+  }
+
+  return { hechos, respuestaDirecta, analisis };
+}
+
+function initGroqCarlyLite() {
+  groqCarlyLite.init({
+    getRestaurante: () => restaurante,
+    getConfig: () => botConfigStore.getConfig(),
+    etiquetaPasoPedido
+  });
+}
+
+async function responderConGroqCarly(
+  estado,
+  pregunta,
+  timeoutMs = GROQ_TIMEOUT_MS,
+  hechosPrecalculados = null
+) {
   if (!groqEstaActivo()) return "ESCALAR";
 
-  const system = construirSystemPromptCarly(estado);
-  if (!Array.isArray(estado.historialGroq)) estado.historialGroq = [];
-  const historial = estado.historialGroq.slice(-8);
-
-  const messages = [{ role: "system", content: system }];
-  for (const turn of historial) {
-    messages.push(turn);
-  }
-  messages.push({ role: "user", content: String(pregunta || "").trim() || "hola" });
+  const hechos = hechosPrecalculados || prepararContextoGroqLite(estado, pregunta).hechos;
 
   console.log("🤖 Carly — cliente:", pregunta);
   console.log("🤖 Carly — paso:", estado.pasoPedido || "—");
+  console.log(`🤖 Carly — modo: ${GROQ_LITE_MODE ? "lite" : "completo"}, hechos: ${hechos.length}`);
 
   try {
-    let timeoutHandle;
-    const timeoutPromise = new Promise((resolve) => {
-      timeoutHandle = setTimeout(() => resolve(GROQ_TIMEOUT_SENTINEL), timeoutMs);
-    });
-    const apiPromise = (async () => {
-      const completion = await groqClient.chat.completions.create({
+    let respuesta;
+    if (GROQ_LITE_MODE) {
+      respuesta = await groqCarlyLite.completar({
+        groqClient,
         model: GROQ_MODEL_NAME,
-        messages,
-        temperature: 0.5,
-        max_tokens: 280
+        estado,
+        pregunta,
+        hechos,
+        timeoutMs,
+        timeoutSentinel: GROQ_TIMEOUT_SENTINEL
       });
-      const text = String(completion?.choices?.[0]?.message?.content || "").trim();
-      return text || "ESCALAR";
-    })();
-    const respuesta = await Promise.race([apiPromise, timeoutPromise]);
-    clearTimeout(timeoutHandle);
+    } else {
+      const system = construirSystemPromptCarly(estado);
+      if (!Array.isArray(estado.historialGroq)) estado.historialGroq = [];
+      const historial = estado.historialGroq.slice(-8);
+      const messages = [{ role: "system", content: system }];
+      for (const turn of historial) messages.push(turn);
+      messages.push({ role: "user", content: String(pregunta || "").trim() || "hola" });
+      let timeoutHandle;
+      const timeoutPromise = new Promise((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(GROQ_TIMEOUT_SENTINEL), timeoutMs);
+      });
+      const apiPromise = (async () => {
+        const completion = await groqClient.chat.completions.create({
+          model: GROQ_MODEL_NAME,
+          messages,
+          temperature: 0.5,
+          max_tokens: 280
+        });
+        return String(completion?.choices?.[0]?.message?.content || "").trim() || "ESCALAR";
+      })();
+      respuesta = await Promise.race([apiPromise, timeoutPromise]);
+      clearTimeout(timeoutHandle);
+    }
+
     if (respuesta === GROQ_TIMEOUT_SENTINEL) {
       console.warn(`⚠️ Groq timeout (>${timeoutMs}ms)`);
       return "ESCALAR";
     }
-    estado.historialGroq.push({ role: "user", content: String(pregunta || "").trim() });
+    const preguntaStr = String(pregunta || "").trim();
+    estado.historialGroq.push({ role: "user", content: preguntaStr });
     estado.historialGroq.push({ role: "assistant", content: respuesta });
-    if (estado.historialGroq.length > 16) {
-      estado.historialGroq = estado.historialGroq.slice(-16);
+    if (estado.historialGroq.length > 12) {
+      estado.historialGroq = estado.historialGroq.slice(-12);
     }
     return respuesta;
   } catch (err) {
-    console.error("❌ Groq error:", err?.message || err);
+    const msg = String(err?.message || err || "");
+    const status = err?.status ?? err?.response?.status ?? err?.error?.status;
+    const is429 =
+      status === 429 ||
+      /rate limit|rate_limit|too many requests|429/i.test(msg);
+    console.error("❌ Groq error:", msg);
+    if (is429) {
+      console.warn("⚠️ Groq límite de cuota (429) — usando fallback local");
+      return GROQ_RATE_LIMIT_SENTINEL;
+    }
     return "ESCALAR";
   }
 }
@@ -3652,6 +3863,8 @@ async function startBot() {
   descripcionesMap = await cargarDescripciones();
   rebuildDetectCache();
   initFuzzyCarly();
+  initCarlyIntents();
+  initGroqCarlyLite();
   inicializarRestauranteCache();
 
   telegramAdmin.start({
