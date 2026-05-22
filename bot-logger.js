@@ -32,5 +32,9 @@ module.exports = {
   escalado: (evento, payload) => emitir("escalado", evento, payload),
   error: (evento, payload) => emitir("error", evento, payload),
   promo: (evento, payload) => emitir("promo", evento, payload),
-  cliente: (evento, payload) => emitir("cliente", evento, payload)
+  cliente: (evento, payload) => emitir("cliente", evento, payload),
+  contexto: (evento, payload) => emitir("contexto", evento, payload),
+  contexto_usado: (evento, payload) => emitir("contexto_usado", evento, payload),
+  fallback: (evento, payload) => emitir("fallback", evento, payload),
+  no_entendido: (evento, payload) => emitir("no_entendido", evento, payload)
 };

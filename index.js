@@ -33,6 +33,7 @@ const consultasCarly = require("./consultas-carly");
 const botLogger = require("./bot-logger");
 const carritoEdiciones = require("./carrito-ediciones");
 const mensajesCarly = require("./mensajes-carly");
+const contextoCarly = require("./contexto-carly");
 const RESPUESTA_LOCAL_YA_ENVIADA = "__RESPUESTA_LOCAL_YA_ENVIADA__";
 
 // Firestore (opcional). Si falta clave.json o falla la inicialización, el bot
@@ -71,7 +72,7 @@ const MENSAJE_BOT_PAUSADO_GLOBAL =
 const MENSAJE_ESCALADO_CLIENTE_DEFAULT =
   "😊 En un momentito te atiende alguien del equipo para ayudarte mejor 🍕\n¡Gracias por tu paciencia!";
 const MENSAJE_FALLBACK_SIN_GROQ_DEFAULT =
-  "😊 Puedo ayudarte así:\n• *Promos* — promociones del día\n• *Precio* — ej. *hawaiana grande*\n• *Pedido* — sabor + tamaño (ej. *peperoni familiar*)\n• *Horario* o *domicilio*\n\nEscribe lo que necesites 🍕";
+  "🤔 Perdón, no entendí bien.\nPuedes escribirme por ejemplo:\n• *hawaiana grande*\n• *precio de alitas*\n• *promos*\n🍕";
 const GROQ_RATE_LIMIT_SENTINEL = "__RATE_LIMIT__";
 const TELEGRAM_PANEL_ENABLED = process.env.TELEGRAM_PANEL !== "0";
 const TELEGRAM_ADMIN_IDS = process.env.TELEGRAM_ADMIN_IDS || "";
@@ -484,6 +485,7 @@ async function recargarRestauranteSiCambioAsync() {
       restaurante = cargarRestaurante();
       aplicarBotConfigAMemoria(botConfigStore.getConfig());
       if (typeof initCarritoEdiciones === "function") initCarritoEdiciones();
+      if (typeof initContextoCarly === "function") initContextoCarly();
       initCarlyIntents();
       initPagoCarly();
       initConsultasCarly();
@@ -1981,6 +1983,9 @@ async function enviarCombosAlCliente(sock, from, estado) {
 }
 
 async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto) {
+  const rCtx = contextoCarly.intentarRespuestaConContexto(estado, textoClean);
+  if (rCtx) return rCtx;
+
   if (!["G", "H", "I"].includes(estado.pasoPedido)) {
     const rConsulta = await consultasCarly.intentarRespuesta(sock, from, estado, textoClean);
     if (rConsulta === "__ENVIADO__") return RESPUESTA_LOCAL_YA_ENVIADA;
@@ -2161,7 +2166,16 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       "5": "mega"
     };
     const tam = mapa[textoClean] || detectarTamano(textoClean);
-    const pizza = estado.ingredientes?.[0];
+    let pizza = estado.ingredientes?.[0];
+    if (
+      !pizza &&
+      tam &&
+      contextoCarly.memoriaVigente(estado) &&
+      estado.ctxMemoria?.ultimoTema === "pizza"
+    ) {
+      const pCtx = estado.ctxMemoria.ultimoProducto;
+      if (pCtx && menu[pCtx]?.[tam]) pizza = pCtx;
+    }
     if (tam && pizza && menu[pizza]?.[tam]) {
       estado.tamano = tam;
       estado.pasoPedido = "C";
@@ -2249,32 +2263,26 @@ function mensajeEscaladoParaCliente() {
   return custom || MENSAJE_ESCALADO_CLIENTE_DEFAULT;
 }
 
-function respuestaFallbackSinGroq(estado, textoClean) {
-  const custom = String(restaurante?.mensajeFallbackSinGroq || "").trim();
-  if (custom) return custom;
-
-  const partes = [MENSAJE_FALLBACK_SIN_GROQ_DEFAULT];
-  const promos = obtenerPromosVigentes();
-  if (promos.length === 1) {
-    const p = promos[0];
-    const det = textoPromoCortoParaCliente(p);
-    if (det) {
-      partes.push(`🔥 Hoy: *${p.titulo || "promo"}* — ${det}`);
-    }
-  }
-  if (estado?.pasoPedido && estado.pasoPedido !== "G") {
-    partes.push(
-      `📋 Sigues en pedido (paso ${estado.pasoPedido}). Escríbeme el dato que falta o *cancelar*.`
-    );
-  }
-  return partes.join("\n\n");
+function respuestaFallbackSinGroq(estado, motivo = "") {
+  return contextoCarly.respuestaFallbackInteligente(estado, motivo);
 }
 
-async function manejarFalloGroqOSinIA(sock, from, estado, quien, motivo = "") {
-  const fb = respuestaFallbackSinGroq(estado, motivo);
+async function manejarFalloGroqOSinIA(sock, from, estado, quien, motivo = "", opts = {}) {
+  const textoCleanCtx = opts.textoClean
+    ? sinAcentos(normalizarTextoPedido(opts.textoClean))
+    : "";
   const esRateLimit =
     motivo === GROQ_RATE_LIMIT_SENTINEL || /rate.?limit|429|cuota/i.test(String(motivo || ""));
 
+  if (!esRateLimit && textoCleanCtx) {
+    const rCtx = contextoCarly.intentarRespuestaConContexto(estado, textoCleanCtx);
+    if (rCtx) {
+      await sendText(sock, from, estado, rCtx);
+      return;
+    }
+  }
+
+  const fb = contextoCarly.respuestaFallbackInteligente(estado, motivo);
   if (esRateLimit) {
     const texto = fb ? `${mensajeEscaladoParaCliente()}\n\n${fb}` : mensajeEscaladoParaCliente();
     await sendText(sock, from, estado, texto);
@@ -2282,12 +2290,7 @@ async function manejarFalloGroqOSinIA(sock, from, estado, quien, motivo = "") {
     return;
   }
 
-  if (fb) {
-    await sendText(sock, from, estado, fb);
-  } else {
-    await sendText(sock, from, estado, mensajeEscaladoParaCliente());
-    await activarModoHumano(sock, from, estado, quien, motivo, { skipMensajeCliente: true });
-  }
+  await sendText(sock, from, estado, fb || respuestaFallbackSinGroq(estado, motivo));
 }
 
 function jidEsAdmin(jid) {
@@ -2429,6 +2432,11 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   if (estado.pasoPedido && !["G", "H", "I"].includes(estado.pasoPedido)) {
     if (await intentarContextoPedidoLocal(sock, from, estado, textoClean)) return;
     if (await responderAvanceFlujoPedido(sock, from, estado, snapPedidoAntes)) return;
+    const rCtxPaso = contextoCarly.intentarRespuestaConContexto(estado, textoClean);
+    if (rCtxPaso) {
+      await sendText(sock, from, estado, rCtxPaso);
+      return;
+    }
     await sendText(sock, from, estado, textoAyudaPasoPedido(estado));
     return;
   }
@@ -2487,6 +2495,7 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   }
 
   if (respLocal) {
+    contextoCarly.actualizarContextoDesdeTexto(estado, textoClean);
     await sendText(sock, from, estado, respLocal);
     if (estado.escalarTrasRespuesta) {
       estado.escalarTrasRespuesta = false;
@@ -2497,14 +2506,17 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     return;
   }
 
+  contextoCarly.actualizarContextoDesdeTexto(estado, textoClean);
+  const rCtxTarde = contextoCarly.intentarRespuestaConContexto(estado, textoClean);
+  if (rCtxTarde) {
+    await sendText(sock, from, estado, rCtxTarde);
+    return;
+  }
+
   if (!groqEstaActivo()) {
-    await manejarFalloGroqOSinIA(
-      sock,
-      from,
-      estado,
-      quien,
-      USE_GROQ ? "Groq desactivado desde panel" : "Groq no configurado"
-    );
+    await manejarFalloGroqOSinIA(sock, from, estado, quien, "sin_groq", {
+      textoClean
+    });
     return;
   }
 
@@ -2527,7 +2539,13 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     !respuesta ||
     /^ESCALAR\b/i.test(respuesta)
   ) {
-    await manejarFalloGroqOSinIA(sock, from, estado, quien, textoClean || texto);
+    const motivoGroq =
+      respuesta === GROQ_TIMEOUT_SENTINEL
+        ? GROQ_TIMEOUT_SENTINEL
+        : respuesta === GROQ_RATE_LIMIT_SENTINEL
+          ? GROQ_RATE_LIMIT_SENTINEL
+          : "sin_respuesta_groq";
+    await manejarFalloGroqOSinIA(sock, from, estado, quien, motivoGroq, { textoClean });
     return;
   }
 
@@ -3007,7 +3025,8 @@ function nuevoEstadoCliente() {
     formaPago: null,
     pagoCon: null,
     esperandoSaborParaPrecio: null,
-    precioConsultaReciente: null
+    precioConsultaReciente: null,
+    ctxMemoria: contextoCarly.crearMemoria()
   };
 }
 
@@ -4105,6 +4124,30 @@ function recalcularExtrasTotal(estado) {
   estado.extrasLineas = lineas;
 }
 
+function initContextoCarly() {
+  contextoCarly.init({
+    sinAcentos,
+    normalizarTextoPedido,
+    detectarIngredientes,
+    detectarTamano,
+    obtenerComplementoPorEntrada,
+    esConsultaPrecio,
+    resolverConsultaPrecio,
+    getMenu: () => menu,
+    getComplementosItems: () => complementosItems,
+    getBebidasItems: () => bebidasItems,
+    getSalsasLista: () => restaurante.alitasBonelessSalsas?.lista || [],
+    nombresSalsaCoincidenEnTexto,
+    capitalizar,
+    textoAyudaPasoPedido,
+    obtenerPromosVigentes,
+    textoPromoCortoParaCliente,
+    getRestaurante: () => restaurante,
+    MENSAJE_FALLBACK_DEFAULT: MENSAJE_FALLBACK_SIN_GROQ_DEFAULT,
+    botLogger
+  });
+}
+
 function initCarritoEdiciones() {
   carritoEdiciones.init({
     sinAcentos,
@@ -4451,6 +4494,7 @@ async function startBot() {
   rebuildDetectCache();
   botLogger.init({ registrarEventoMetricas });
   initCarritoEdiciones();
+  initContextoCarly();
   initFuzzyCarly();
   initPagoCarly();
   initConsultasCarly();
