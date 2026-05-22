@@ -2682,6 +2682,12 @@ async function activarModoHumano(sock, from, estado, quien, motivo = "", opts = 
 }
 
 async function confirmarPedidoYPasarAHumano(sock, from, estado, quien) {
+  if (estado._confirmandoPedido || estado._pedidoConfirmadoAt) {
+    console.log("[Carly] confirmarPedido ignorado (ya confirmado o en curso)");
+    return;
+  }
+  estado._confirmandoPedido = true;
+
   const resumen = resumenDetalladoPedidoParaCliente(estado);
   const { total } = subtotalesPedidoActuales(estado);
   const dir =
@@ -2722,19 +2728,25 @@ Fecha: ${new Date().toLocaleString()}
     console.error("❌ confirmarPedido pedidos.txt:", err?.message || err);
   }
 
-  await sendText(sock, from, estado, MENSAJE_PASO_A_HUMANO);
-  await notificarUrgenteMovil(sock, {
-    waTitulo: "PEDIDO CONFIRMADO — ATENDER",
-    waDetalle: payload,
-    tgTexto: payload
-  });
-  await registrarEventoMetricas("pedido_confirmado_paso_humano", { from });
-
+  estado._pedidoConfirmadoAt = Date.now();
+  estado._confirmandoPedido = false;
   estado.modoHumano = true;
   estado.tiempoEscalado = Date.now();
   estado.pasoPedido = null;
   estado.pendienteEnvioConfirmacion = false;
   estado.historialGroq = [];
+
+  try {
+    await sendText(sock, from, estado, MENSAJE_PASO_A_HUMANO);
+    await notificarUrgenteMovil(sock, {
+      waTitulo: "PEDIDO CONFIRMADO — ATENDER",
+      waDetalle: payload,
+      tgTexto: payload
+    });
+    await registrarEventoMetricas("pedido_confirmado_paso_humano", { from });
+  } catch (err) {
+    console.error("❌ confirmarPedido notificaciones:", err?.message || err);
+  }
 }
 
 const GROQ_TIMEOUT_MS = 15000;
@@ -3140,17 +3152,63 @@ function nuevoEstadoCliente() {
     pagoCon: null,
     esperandoSaborParaPrecio: null,
     precioConsultaReciente: null,
-    ctxMemoria: contextoCarly.crearMemoria()
+    ctxMemoria: contextoCarly.crearMemoria(),
+    _processedMessageIds: []
   };
 }
 
 const estados = {};
 const ultimoPedidoPorCliente = {};
 let reconnectScheduled = false;
+let currentSock = null;
+const MAX_PROCESSED_MSG_IDS = 50;
+
+function mensajeIdDeKey(msg) {
+  return msg?.key?.id || null;
+}
+
+function mensajeYaProcesado(estado, msgId) {
+  if (!msgId || !estado) return false;
+  return Array.isArray(estado._processedMessageIds) && estado._processedMessageIds.includes(msgId);
+}
+
+function marcarMensajeProcesado(estado, msgId) {
+  if (!msgId || !estado) return;
+  if (!Array.isArray(estado._processedMessageIds)) estado._processedMessageIds = [];
+  if (estado._processedMessageIds.includes(msgId)) return;
+  estado._processedMessageIds.push(msgId);
+  if (estado._processedMessageIds.length > MAX_PROCESSED_MSG_IDS) {
+    estado._processedMessageIds = estado._processedMessageIds.slice(-MAX_PROCESSED_MSG_IDS);
+  }
+}
+
+function limpiarTimersEstado(st) {
+  if (!st) return;
+  if (st._burstTimer) {
+    clearTimeout(st._burstTimer);
+    st._burstTimer = null;
+  }
+}
+
+async function cerrarSocketAnterior() {
+  if (!currentSock) return;
+  try {
+    currentSock.ev?.removeAllListeners?.();
+    if (typeof currentSock.ws?.close === "function") {
+      currentSock.ws.close();
+    } else if (typeof currentSock.end === "function") {
+      currentSock.end();
+    }
+  } catch (err) {
+    console.warn("⚠️ Cerrando socket previo:", err?.message || err);
+  }
+  currentSock = null;
+}
 const TEXTO_MENU_TAMANOS = "📏 ¿Qué tamaño quieres?\n\n1️⃣ Mediana\n2️⃣ Grande\n3️⃣ Familiar\n4️⃣ Jumbo\n5️⃣ Mega";
 
 function resetEstadoCliente(jid, prevEstado = null) {
   const keepNotif = !!(prevEstado?.notificadoInicio || estados[jid]?.notificadoInicio);
+  limpiarTimersEstado(estados[jid]);
   estados[jid] = nuevoEstadoCliente();
   estados[jid].notificadoInicio = keepNotif;
 }
@@ -3160,6 +3218,7 @@ setInterval(() => {
   for (const [jid, st] of Object.entries(estados)) {
     if (!st?.ultimaActividadAt) continue;
     if (now - st.ultimaActividadAt > SESSION_INACTIVITY_MS) {
+      limpiarTimersEstado(st);
       delete estados[jid];
     }
   }
@@ -3184,6 +3243,7 @@ async function enviarTelegram(texto) {
     );
   } catch (err) {
     console.error("❌ Error enviando Telegram:", err?.response?.data || err?.message || err);
+    throw err;
   }
 }
 
@@ -3221,13 +3281,42 @@ async function sendWhatsAppAdminUrgente(sock, titulo, detalle = "") {
 }
 
 async function notificarUrgenteMovil(sock, { waTitulo, waDetalle, tgTexto }) {
-  const waTask = sendWhatsAppAdminUrgente(sock, waTitulo, waDetalle);
-  const tgTask = tgTexto
+  const intentaWa = !!NUMERO_ADMIN;
+  const intentaTg = !!(tgTexto && TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+  const waTask = intentaWa
+    ? sendWhatsAppAdminUrgente(sock, waTitulo, waDetalle)
+    : Promise.resolve();
+  const tgTask = intentaTg
     ? retryAsync(() => enviarTelegram(tgTexto), { attempts: 3, baseDelayMs: 700 })
     : Promise.resolve();
   const results = await Promise.allSettled([waTask, tgTask]);
-  if (results[0].status === "rejected") {
-    console.error("❌ Error enviando WhatsApp admin:", results[0].reason?.message || results[0].reason);
+  let waOk = !intentaWa;
+  let tgOk = !intentaTg;
+  if (intentaWa) {
+    waOk = results[0].status === "fulfilled";
+    if (!waOk) {
+      console.error(
+        "❌ Error enviando WhatsApp admin:",
+        results[0].reason?.message || results[0].reason
+      );
+    }
+  }
+  if (intentaTg) {
+    tgOk = results[1].status === "fulfilled";
+    if (!tgOk) {
+      console.error(
+        "❌ Error enviando Telegram (tras reintentos):",
+        results[1].reason?.message || results[1].reason
+      );
+    }
+  }
+  if ((intentaWa || intentaTg) && !waOk && !tgOk) {
+    console.error("🚨 [Carly] pedido_confirmado_sin_notificacion — revisar pedido manualmente");
+    registrarEventoMetricas("pedido_confirmado_sin_notificacion", {
+      waTitulo: String(waTitulo || "").slice(0, 80),
+      intentaWa,
+      intentaTg
+    }).catch(() => {});
   }
 }
 
@@ -4525,8 +4614,15 @@ async function procesarConsultasPorComas(sock, from, textoClean, quien) {
 }
 
 async function derivarPedidoAHumano(sock, from, estado, quien, detalle = "") {
+  if (estado._derivandoPedido || estado._pedidoDerivadoAt) {
+    console.log("[Carly] derivarPedido ignorado (ya derivado o en curso)");
+    return;
+  }
+  estado._derivandoPedido = true;
+
   const resumen = resumenDetalladoPedidoParaCliente(estado);
   const extra = String(detalle || "").trim();
+  try {
   await sendText(
     sock,
     from,
@@ -4584,6 +4680,10 @@ Fecha: ${new Date().toLocaleString()}
   // Pausa el bot esperando confirmación del humano.
   estado.paso = "esperando_humano";
   estado.esperandoHumanoHasta = Date.now() + 8 * 60 * 1000; // 8 min
+  estado._pedidoDerivadoAt = Date.now();
+  } finally {
+    estado._derivandoPedido = false;
+  }
 }
 
 async function aplicarPostEleccionSalsa(sock, from, estado, quien) {
@@ -4666,6 +4766,8 @@ async function aplicarPostEleccionSalsa(sock, from, estado, quien) {
 }
 
 async function startBot() {
+  await cerrarSocketAnterior();
+
   const { useFirestoreAuthState } = require("./baileys-firestore-auth-state");
   botConfigStore.init({ firestore });
   await botConfigStore.loadFromFirestore();
@@ -4754,6 +4856,7 @@ async function startBot() {
     auth: state,
     browser: ["Windows", "Chrome", "120.0.0"]
   });
+  currentSock = sock;
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -4815,19 +4918,27 @@ async function startBot() {
   }
 });
 
-sock.ev.on("messages.upsert", async ({ messages }) => {
-  try {
-  const msg = messages[0];
-  if (!msg.message) return;
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    try {
+      const lista = Array.isArray(messages) ? messages : [];
+      for (const msg of lista) {
+        await procesarMensajeUpsert(sock, msg);
+      }
+    } catch (err) {
+      console.error("❌ Error en messages.upsert:", err?.message || err);
+    }
+  });
+}
 
-  // ❌ IGNORAR MENSAJES DEL BOT
+async function procesarMensajeUpsert(sock, msg) {
+  if (!msg?.message) return;
   if (msg.key.fromMe) return;
 
   const from = msg.key.remoteJid;
-  // Solo chats 1:1; ignorar grupos (@g.us) y cualquier otro JID.
   if (!esChatIndividual(from)) return;
   if (esJidSistema(from)) return;
 
+  const msgId = mensajeIdDeKey(msg);
   const quien = etiquetaCliente(msg);
 
   if (
@@ -4843,6 +4954,11 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
   }
 
   const estado = estados[from];
+  if (mensajeYaProcesado(estado, msgId)) {
+    console.log("[Carly] mensaje duplicado ignorado", msgId || "?");
+    return;
+  }
+
   estado.ultimaActividadAt = Date.now();
 
   const texto =
@@ -4853,32 +4969,60 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
   const textoLower = texto.toLowerCase();
   const textoClean = sinAcentos(textoLower.trim());
 
-  console.log("📩", from, textoClean);
+  console.log("📩", from, textoClean, msgId ? `id=${msgId}` : "");
   estado.lastUserMessageAt = Date.now();
 
-  if (await manejarComandoAdmin(sock, from, texto)) return;
+  if (await manejarComandoAdmin(sock, from, texto)) {
+    marcarMensajeProcesado(estado, msgId);
+    return;
+  }
 
   if (!botAtiendeChat(from)) {
     const cfg = botConfigStore.getConfig();
     const pausa =
       cfg.botActivoGlobal === false ? MENSAJE_BOT_PAUSADO_GLOBAL : MENSAJE_BOT_PAUSADO_CHAT;
     await sendText(sock, from, estado, pausa);
+    marcarMensajeProcesado(estado, msgId);
     return;
   }
 
   const st = estados[from];
   if (!st) return;
 
-  const ejecutarProcesamiento = async (t, tc, esNuevo) => {
+  const drenarColaPendiente = () => {
+    const pend = st._pendingMessages?.shift();
+    if (pend) {
+      setImmediate(() => {
+        ejecutarProcesamiento(
+          pend.msg || msg,
+          pend.texto,
+          pend.textoClean,
+          pend.esNuevo
+        ).catch((err) => console.error("❌ cola mensaje:", err?.message || err));
+      });
+    }
+  };
+
+  const ejecutarProcesamiento = async (msgActivo, t, tc, esNuevo) => {
+    const idActivo = mensajeIdDeKey(msgActivo);
+    if (mensajeYaProcesado(st, idActivo)) {
+      console.log("[Carly] mensaje duplicado ignorado (cola)", idActivo || "?");
+      drenarColaPendiente();
+      return;
+    }
+
     if (st.procesando) {
-      if (!Array.isArray(st._pendingMessages)) st._pendingMessages = [];
-      if (st._pendingMessages.length < MAX_PENDING_MESSAGES) {
-        st._pendingMessages.push({
-          texto: t,
-          textoClean: tc,
-          esNuevo: !!esNuevo,
-          at: Date.now()
-        });
+      if (!mensajeYaProcesado(st, idActivo)) {
+        if (!Array.isArray(st._pendingMessages)) st._pendingMessages = [];
+        if (st._pendingMessages.length < MAX_PENDING_MESSAGES) {
+          st._pendingMessages.push({
+            msg: msgActivo,
+            texto: t,
+            textoClean: tc,
+            esNuevo: !!esNuevo,
+            at: Date.now()
+          });
+        }
       }
       return;
     }
@@ -4888,41 +5032,27 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
     };
     const watchdog = setTimeout(liberarProcesando, PROCESANDO_MAX_MS);
     try {
-      await procesarConversacionCarly(sock, msg, from, quien, st, t, tc, esNuevo);
+      await procesarConversacionCarly(sock, msgActivo, from, quien, st, t, tc, esNuevo);
       humanosCarly.marcarProcesadoBurst(st, t, tc);
+      marcarMensajeProcesado(st, mensajeIdDeKey(msgActivo));
     } finally {
       clearTimeout(watchdog);
       liberarProcesando();
-      const pend = st._pendingMessages?.shift();
-      if (pend) {
-        setImmediate(() => {
-          ejecutarProcesamiento(pend.texto, pend.textoClean, pend.esNuevo).catch((err) =>
-            console.error("❌ cola mensaje:", err?.message || err)
-          );
-        });
-      }
+      drenarColaPendiente();
     }
   };
 
   if (humanosCarly.debeAgruparBurst(st, textoClean)) {
     humanosCarly.encolarBurst(st, { texto, textoClean }, ({ texto: t, textoClean: tc }) => {
-      ejecutarProcesamiento(t, tc, false).catch((err) =>
+      ejecutarProcesamiento(msg, t, tc, false).catch((err) =>
         console.error("❌ burst procesar:", err?.message || err)
       );
     });
     return;
   }
 
-  await ejecutarProcesamiento(texto, textoClean, esNuevoCliente);
-  return;
-  } catch (err) {
-    console.error("❌ Error en messages.upsert:", err?.message || err);
-  }
-
-  });
+  await ejecutarProcesamiento(msg, texto, textoClean, esNuevoCliente);
 }
-
-
 
 const app = express();
 app.get("/", (_req, res) => res.status(200).send("Bot activo"));
