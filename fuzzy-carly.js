@@ -30,6 +30,10 @@ const TYPO_GLOBAL = {
   jawaiana: "hawaiana",
   hawaianna: "hawaiana",
   jawaianana: "hawaiana",
+  hauwalana: "hawaiana",
+  haualana: "hawaiana",
+  hawaina: "hawaiana",
+  hawayana: "hawaiana",
   peperony: "peperoni",
   peperonni: "peperoni",
   jumno: "jumbo",
@@ -180,6 +184,48 @@ function mejorMatchEnTexto(textoNorm, item) {
     }
   }
   return best;
+}
+
+/**
+ * Fuzzy solo para sabores de pizza (no complementos ni bebidas).
+ * Un solo match si la similitud es clara; evita falsos positivos.
+ */
+function buscarSaboresPizzaSolo(textoClean) {
+  const menu = deps.getMenu() || {};
+  const keys = Object.keys(menu);
+  if (!keys.length) return [];
+
+  const t = normFuzzy(textoClean);
+  if (!t || t.length < 4) return [];
+
+  const { media } = getUmbrales();
+  const umbral = Math.max(0.76, media - 0.04);
+  const tokens = [
+    ...t.split(/[^a-z0-9]+/).filter((w) => w.length >= 4),
+    t.length >= 5 ? t : null
+  ].filter(Boolean);
+
+  const candidates = [];
+  for (const p of keys) {
+    const pn = normFuzzy(p);
+    if (!pn || pn.length < 4) continue;
+    let best = 0;
+    for (const tok of tokens) {
+      if (Math.abs(tok.length - pn.length) > 4) continue;
+      best = Math.max(best, similitudTexto(tok, pn));
+    }
+    if (best >= umbral) candidates.push({ pizza: p, score: best });
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  if (!candidates.length) return [];
+  if (
+    candidates.length >= 2 &&
+    candidates[0].score - candidates[1].score < 0.07
+  ) {
+    return [];
+  }
+  return [candidates[0].pizza];
 }
 
 function buscarMatches(textoClean) {
@@ -473,5 +519,6 @@ module.exports = {
   manejarConfirmacionPendiente,
   registrarAprendizaje,
   textoNoEntendido,
-  textoConfirmacion
+  textoConfirmacion,
+  buscarSaboresPizzaSolo
 };

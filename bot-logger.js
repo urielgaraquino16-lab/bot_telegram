@@ -36,5 +36,8 @@ module.exports = {
   contexto: (evento, payload) => emitir("contexto", evento, payload),
   contexto_usado: (evento, payload) => emitir("contexto_usado", evento, payload),
   fallback: (evento, payload) => emitir("fallback", evento, payload),
-  no_entendido: (evento, payload) => emitir("no_entendido", evento, payload)
+  no_entendido: (evento, payload) => emitir("no_entendido", evento, payload),
+  fuzzy: (evento, payload) => emitir("fuzzy", evento, payload),
+  objecion: (evento, payload) => emitir("objecion", evento, payload),
+  confirm_multi: (evento, payload) => emitir("confirm_multi", evento, payload)
 };

@@ -34,6 +34,7 @@ const botLogger = require("./bot-logger");
 const carritoEdiciones = require("./carrito-ediciones");
 const mensajesCarly = require("./mensajes-carly");
 const contextoCarly = require("./contexto-carly");
+const objecionesCarly = require("./objeciones-carly");
 const RESPUESTA_LOCAL_YA_ENVIADA = "__RESPUESTA_LOCAL_YA_ENVIADA__";
 
 // Firestore (opcional). Si falta clave.json o falla la inicialización, el bot
@@ -1282,7 +1283,6 @@ function sugerirPizzaSimilar(texto) {
 function detectarInicioPedido(textoClean) {
   const x = textoClean;
   if (/(pedido|ordenar|hacer pedido|comprar pizza)/.test(x)) return true;
-  if (/\b(me manda|manden|mandame|envien|envío|envio)\b/.test(x)) return true;
   if (/\b(quiero|dame|necesito|ponme)\b/.test(x) && /\b(pizza|pedido|ordenar)\b/.test(x)) {
     return true;
   }
@@ -1389,9 +1389,18 @@ async function intentarContextoPedidoLocal(sock, from, estado, textoClean) {
     if (sabor && menu[sabor]) {
       estado.ingredientes = [sabor];
       if (tam && menu[sabor][tam]) estado.tamano = tam;
+      const dir = detectarDireccionEnTexto(textoClean);
+      if (dir && !/(domicilio|recoger|pickup|tienda)/.test(textoClean)) {
+        estado.direccionPendienteTexto = dir;
+      }
       estado.pasoPedido = estado.tamano ? "D" : "B";
       estado.precioConsultaReciente = null;
-      botLogger.estado("pedir_tras_precio", { sabor, tamano: estado.tamano, paso: estado.pasoPedido });
+      botLogger.estado("pedir_tras_precio", {
+        sabor,
+        tamano: estado.tamano,
+        paso: estado.pasoPedido,
+        dirPendiente: !!estado.direccionPendienteTexto
+      });
       return false;
     }
   }
@@ -1423,6 +1432,19 @@ async function responderAvanceFlujoPedido(sock, from, estado, antes) {
     return true;
   }
   if (p === "C" && pasoCambio && ings && estado.tamano) {
+    if (estado._pendienteConfirmMulti) {
+      estado._pendienteConfirmMulti = false;
+      const multi = mensajesCarly.mensajeConfirmacionMulti(estado, {
+        capitalizar,
+        subtotalesPedidoActuales,
+        complementoRequiereSalsa
+      });
+      if (multi) {
+        botLogger.confirm_multi("paso_c", { items: estado.lineasComplemento?.length || 0 });
+        await sendText(sock, from, estado, multi);
+        return true;
+      }
+    }
     await sendText(
       sock,
       from,
@@ -1490,6 +1512,15 @@ function textoPreciosTamanoParaPizza(pizzaKey) {
 }
 
 function mensajeSeguimientoTrasFuzzy(estado, propuesta) {
+  const multi = mensajesCarly.mensajeConfirmacionMulti(estado, {
+    capitalizar,
+    subtotalesPedidoActuales,
+    complementoRequiereSalsa
+  });
+  if (multi) {
+    botLogger.confirm_multi("fuzzy", { tipo: propuesta?.tipo });
+    return multi;
+  }
   if (!propuesta) return "✅ Listo. ¿Qué más te gustaría? 🍕";
   if (propuesta.tipo === "mitad_mitad") {
     const [a, b] = propuesta.ingredientes || [];
@@ -1983,6 +2014,15 @@ async function enviarCombosAlCliente(sock, from, estado) {
 }
 
 async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto) {
+  const rObj = objecionesCarly.intentarRespuestaObjecion(estado, textoClean, {
+    sinAcentos,
+    normalizarTextoPedido,
+    capitalizar,
+    subtotalesPedidoActuales,
+    botLogger
+  });
+  if (rObj) return rObj;
+
   const rCtx = contextoCarly.intentarRespuestaConContexto(estado, textoClean);
   if (rCtx) return rCtx;
 
@@ -2147,8 +2187,12 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
         } else {
           estado.pasoPedido = "B";
         }
+        if (aplicarComplementosYBebidasDesdeTexto(estado, textoClean)) {
+          estado._pendienteConfirmMulti = true;
+        }
       } else {
-        const sug = sugerirPizzaSimilar(textoClean);
+        const fuzzySug = fuzzyCarly.buscarSaboresPizzaSolo(textoClean)[0];
+        const sug = fuzzySug || sugerirPizzaSimilar(textoClean);
         if (sug) {
           estado.pizzaSugerida = sug;
         }
@@ -2220,8 +2264,15 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
   if (estado.pasoPedido === "E") {
     if (/(domicilio|a domicilio|envio|envío|a casa|a mi casa)/.test(textoClean)) {
       estado.tipoServicio = "domicilio";
-      estado.pasoPedido = "F";
-      estado.subPasoDireccion = "calle";
+      if (estado.direccionPendienteTexto) {
+        estado.dirCalle = estado.direccionPendienteTexto;
+        estado.direccionPendienteTexto = null;
+        estado.pasoPedido = "F";
+        estado.subPasoDireccion = "entre";
+      } else {
+        estado.pasoPedido = "F";
+        estado.subPasoDireccion = "calle";
+      }
     } else if (/(recoger|pickup|paso|tienda|local|recojo)/.test(textoClean)) {
       estado.tipoServicio = "recoger";
       marcarPasoConfirmacionPedido(estado);
@@ -2474,6 +2525,18 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   const aclaracion = intentarAclaracionAmbigua(textoClean, estado);
   if (aclaracion) {
     await sendText(sock, from, estado, aclaracion);
+    return;
+  }
+
+  const rObj = objecionesCarly.intentarRespuestaObjecion(estado, textoClean, {
+    sinAcentos,
+    normalizarTextoPedido,
+    capitalizar,
+    subtotalesPedidoActuales,
+    botLogger
+  });
+  if (rObj) {
+    await sendText(sock, from, estado, rObj);
     return;
   }
 
@@ -3639,7 +3702,58 @@ function detectarIngredientes(texto, opts = {}) {
     }
   }
 
+  for (const p of fuzzyCarly.buscarSaboresPizzaSolo(texto)) {
+    if (!encontrados.has(p)) {
+      encontrados.add(p);
+      botLogger.fuzzy("sabor_aplicado", { entrada: String(texto).slice(0, 40), sabor: p });
+    }
+  }
+
   return [...encontrados];
+}
+
+function esConsultaPrecioGeneralPizzas(textoClean) {
+  const x = sinAcentos(normalizarTextoPedido(textoClean));
+  if (detectarIngredientes(textoClean, { permitirFuzzy: false }).length > 0) return false;
+  return (
+    /(precio|cuanto|cuesta|vale|costo).*(pizza|pizzas)/.test(x) ||
+    /(pizza|pizzas).*(precio|cuanto|cuesta)/.test(x) ||
+    /^precio\s+de\s+pizzas?\b/.test(x) ||
+    /^cuanto\s+(cuestan|valen)\s+(las\s+)?pizzas?\b/.test(x)
+  );
+}
+
+function textoListaSaboresParaCotizar(max = 8) {
+  const keys = Object.keys(menu || {}).slice(0, max);
+  if (!keys.length) return null;
+  return keys.map((k) => `• ${capitalizar(k)}`).join("\n");
+}
+
+function aplicarComplementosYBebidasDesdeTexto(estado, textoClean) {
+  const { encontrados: complementos } = detectarComplementosEnTexto(textoClean);
+  const bebidasDet = detectarBebidasEnTexto(textoClean);
+  const salsaPick = parseEleccionSalsa(textoClean);
+  const salsaLabel =
+    salsaPick?.resultado === "ok" ? salsaPick.label : null;
+  let any = false;
+
+  for (const [nombre, cant] of Object.entries(complementos)) {
+    if (!estado.complementos) estado.complementos = {};
+    estado.complementos[nombre] = (estado.complementos[nombre] || 0) + (cant || 1);
+    if (!Array.isArray(estado.lineasComplemento)) estado.lineasComplemento = [];
+    const line = { nombre, cantidad: cant || 1 };
+    if (complementoRequiereSalsa(nombre) && salsaLabel) line.salsa = salsaLabel;
+    estado.lineasComplemento.push(line);
+    any = true;
+  }
+
+  for (const [nombre, cant] of Object.entries(bebidasDet)) {
+    if (!Array.isArray(estado.lineasBebida)) estado.lineasBebida = [];
+    estado.lineasBebida.push({ nombre, cantidad: cant || 1 });
+    any = true;
+  }
+
+  return any;
 }
 
 // 📏 DETECTAR TAMAÑO
@@ -4265,8 +4379,15 @@ function resolverConsultaPrecio(textoClean, estado = null) {
     return msg;
   }
 
+  if (ings.length === 0 && !tam && esConsultaPrecioGeneralPizzas(textoClean)) {
+    const lista = textoListaSaboresParaCotizar();
+    if (lista) {
+      return `🍕 Tenemos:\n${lista}\n\n¿Cuál te cotizo? 😊`;
+    }
+  }
+
   if (ings.length === 0 && !tam) {
-    return "💰 Dime *sabor* o *tamaño* (ej. “grande hawaiana” o “precio de alitas”).";
+    return "💰 Dime *sabor* o *tamaño* (ej. *grande hawaiana* o *precio de alitas*).";
   }
 
   return null;
