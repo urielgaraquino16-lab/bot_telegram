@@ -18,6 +18,7 @@ const PORT = process.env.PORT || 3000;
 const NUMERO_ADMIN = process.env.NUMERO_ADMIN || "";
 
 const fs = require("fs");
+const crypto = require("crypto");
 const axios = require("axios");
 
 const XLSX = require("xlsx");
@@ -69,6 +70,13 @@ const MAX_PENDING_MESSAGES = 5;
 const GUARDAR_PEDIDO_TIMEOUT_MS = 5000;
 const GOOGLE_SHEETS_TIMEOUT_MS = 8000;
 const ARCHIVO_ROTACION_MAX_BYTES = 8 * 1024 * 1024;
+const SNAPSHOT_CRITICO_TTL_MS = 45 * 60 * 1000;
+const FIRESTORE_LATE_WAIT_MS = 12000;
+const MENU_FALLBACK_PATH = ".cache/menu-fallback.json";
+const SNAPSHOT_CRITICO_DIR = ".cache/snapshots-criticos";
+const CONFIRM_KEYS_LOCAL = ".cache/pedidos-confirmados-keys.jsonl";
+const MENSAJE_COLA_SATURADA =
+  "📩 Recibí muchos mensajes.\nPor favor dime tu último pedido en una sola frase 😊";
 const MENSAJE_PASO_A_HUMANO =
   "🙌 ¡Perfecto! Ya te paso con alguien del equipo para cerrar tu pedido.\nEn un momentito te escriben 👋🍕";
 const MENSAJE_BOT_PAUSADO_CHAT =
@@ -306,11 +314,45 @@ async function cargarMenu() {
       console.warn("⚠️ cargarMenu: hoja vacía; se mantiene menú anterior");
       return menuAnterior;
     }
+    if (Object.keys(menuNuevo).length > 0) {
+      guardarMenuFallback(menuNuevo).catch(() => {});
+    }
     return menuNuevo;
   } catch (err) {
     console.warn("⚠️ cargarMenu error:", err?.message || err);
-    return Object.keys(menuAnterior).length > 0 ? menuAnterior : {};
+    if (Object.keys(menuAnterior).length > 0) return menuAnterior;
+    const fb = await cargarMenuFallback();
+    return Object.keys(fb).length > 0 ? fb : {};
   }
+}
+
+async function guardarMenuFallback(menuData) {
+  try {
+    await fsp.mkdir(".cache", { recursive: true });
+    await fsp.writeFile(
+      MENU_FALLBACK_PATH,
+      JSON.stringify({ at: Date.now(), menu: menuData }),
+      "utf8"
+    );
+  } catch (err) {
+    console.warn("⚠️ guardarMenuFallback:", err?.message || err);
+  }
+}
+
+async function cargarMenuFallback() {
+  try {
+    const raw = await fsp.readFile(MENU_FALLBACK_PATH, "utf8");
+    const j = JSON.parse(raw);
+    if (j?.menu && typeof j.menu === "object" && Object.keys(j.menu).length > 0) {
+      console.log("📋 Menú cargado desde fallback local (.cache)");
+      return j.menu;
+    }
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      console.warn("⚠️ cargarMenuFallback:", err?.message || err);
+    }
+  }
+  return {};
 }
 
 let menu = {};
@@ -864,6 +906,44 @@ function extraerPrimeroComplementoQueRequiereSalsa(estado) {
     return { nombre: nom, cantidad: c };
   }
   return null;
+}
+
+function lineaComplementoSinSalsa(estado) {
+  for (const L of estado.lineasComplemento || []) {
+    if (complementoRequiereSalsa(L.nombre) && !etiquetaSalsaComplemento(L)) {
+      return L;
+    }
+  }
+  return null;
+}
+
+function hayComplementosRequiriendoSalsaSinEtiqueta(estado) {
+  return !!lineaComplementoSinSalsa(estado);
+}
+
+function aplicarSalsaALineasSinEtiqueta(estado, salsaLabel) {
+  if (!salsaLabel) return false;
+  let n = 0;
+  for (const L of estado.lineasComplemento || []) {
+    if (complementoRequiereSalsa(L.nombre) && !etiquetaSalsaComplemento(L)) {
+      L.salsaEtiqueta = salsaLabel;
+      n++;
+    }
+  }
+  return n > 0;
+}
+
+async function solicitarSalsaSiFalta(sock, from, estado) {
+  const L = lineaComplementoSinSalsa(estado);
+  if (!L) return false;
+  estado._pendienteSalsaNombre = L.nombre;
+  await sendText(
+    sock,
+    from,
+    estado,
+    `🍗 Para *${capitalizar(L.nombre)}* elige la salsa:\n\n${textoMenuSalsasAlitas()}`
+  );
+  return true;
 }
 
 function textoMenuSalsasAlitas() {
@@ -1911,6 +1991,7 @@ async function manejarPasoPagoPedido(sock, from, estado, quien, textoClean) {
     }
     estado.pasoPedido = "I";
     await sendText(sock, from, estado, c.textoPreguntaEfectivoMonto);
+    persistirSnapshotCritico(from, estado).catch(() => {});
     return true;
   }
 
@@ -2297,7 +2378,9 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
 
   if (estado.pasoPedido === "D") {
     if (/(^no$|ninguno|sin complemento|nada mas|siguiente|listo|asi esta)/.test(textoClean)) {
-      estado.pasoPedido = "E";
+      if (!hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+        estado.pasoPedido = "E";
+      }
       return;
     }
     const pick = resolverItemCatalogoPorNumeroONombre(textoClean);
@@ -2368,6 +2451,11 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
 }
 
 function marcarPasoConfirmacionPedido(estado) {
+  if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+    estado.pasoPedido = "D";
+    estado._bloqueoSalsaPendiente = true;
+    return;
+  }
   estado.pasoPedido = "G";
   estado.pendienteEnvioConfirmacion = true;
 }
@@ -2553,6 +2641,28 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     return;
   }
 
+  if (estado.pasoPedido === "D") {
+    const salsaPick = parseEleccionSalsa(textoClean);
+    if (salsaPick?.resultado === "ok") {
+      if (aplicarSalsaALineasSinEtiqueta(estado, salsaPick.label)) {
+        estado._pendienteSalsaNombre = null;
+        estado._bloqueoSalsaPendiente = false;
+        await sendText(sock, from, estado, `✅ Salsa *${salsaPick.label}* anotada.`);
+        if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+          await solicitarSalsaSiFalta(sock, from, estado);
+        }
+        return;
+      }
+    }
+    if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+      await solicitarSalsaSiFalta(sock, from, estado);
+      return;
+    }
+    if (estado._bloqueoSalsaPendiente) {
+      estado._bloqueoSalsaPendiente = false;
+    }
+  }
+
   if (estado.pasoPedido && !["G", "H", "I"].includes(estado.pasoPedido)) {
     if (await intentarContextoPedidoLocal(sock, from, estado, textoClean)) return;
     if (await responderAvanceFlujoPedido(sock, from, estado, snapPedidoAntes)) return;
@@ -2573,15 +2683,34 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     return;
   }
 
+  if (estado._bloqueoSalsaPendiente && estado.pasoPedido === "D") {
+    estado._bloqueoSalsaPendiente = false;
+    await solicitarSalsaSiFalta(sock, from, estado);
+    return;
+  }
+
   if (estado.pendienteEnvioConfirmacion && estado.pasoPedido === "G") {
+    if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+      estado.pasoPedido = "D";
+      estado.pendienteEnvioConfirmacion = false;
+      await solicitarSalsaSiFalta(sock, from, estado);
+      return;
+    }
     estado.pendienteEnvioConfirmacion = false;
     await sendText(sock, from, estado, textoConfirmacionPedidoCarly(estado));
+    persistirSnapshotCritico(from, estado).catch(() => {});
     return;
   }
 
   if (estado.pasoPedido === "G" && esAfirmacionSimple(textoClean)) {
+    if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+      estado.pasoPedido = "D";
+      await solicitarSalsaSiFalta(sock, from, estado);
+      return;
+    }
     estado.pasoPedido = "H";
     await sendText(sock, from, estado, pagoCarly.cfg().textoPreguntaMetodo);
+    persistirSnapshotCritico(from, estado).catch(() => {});
     return;
   }
 
@@ -2686,6 +2815,10 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   }
 
   await sendText(sock, from, estado, respuesta);
+
+  if (["G", "H", "I"].includes(estado.pasoPedido)) {
+    persistirSnapshotCritico(from, estado).catch(() => {});
+  }
 }
 
 async function activarModoHumano(sock, from, estado, quien, motivo = "", opts = {}) {
@@ -2713,6 +2846,19 @@ async function confirmarPedidoYPasarAHumano(sock, from, estado, quien) {
     console.log("[Carly] confirmarPedido ignorado (ya confirmado o en curso)");
     return;
   }
+  if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+    console.log("[Carly] confirmarPedido bloqueado: salsa pendiente");
+    await solicitarSalsaSiFalta(sock, from, estado);
+    estado.pasoPedido = "D";
+    return;
+  }
+
+  const orderKey = clavePedidoConfirmado(from, estado._ultimoMsgId);
+  if (await pedidoConfirmadoKeyYaExiste(orderKey)) {
+    console.log("[Carly] confirmarPedido ignorado (order key persistente)", orderKey);
+    return;
+  }
+
   estado._confirmandoPedido = true;
 
   const resumen = resumenDetalladoPedidoParaCliente(estado);
@@ -2729,14 +2875,26 @@ async function confirmarPedidoYPasarAHumano(sock, from, estado, quien) {
 
   const telefono = String(from || "").replace(/@.+$/, "");
   let firestorePedidoOk = false;
+  let firestoreTimedOut = false;
   try {
-    const idFirestore = await guardarPedido({
+    const fsRes = await guardarPedido({
       cliente: quien || "Cliente",
       telefono,
       pedido: `${resumen || lineaPizzaEmoji(estado) || "Pedido"} | ${dir}`,
       total: Number(total || 0)
     });
-    firestorePedidoOk = !!idFirestore;
+    firestorePedidoOk = !!fsRes?.id;
+    firestoreTimedOut = !!fsRes?.timedOut;
+    if (!firestorePedidoOk && fsRes?.timedOut && fsRes?.latePromise) {
+      const late = await Promise.race([
+        fsRes.latePromise,
+        new Promise((r) => setTimeout(() => r(null), FIRESTORE_LATE_WAIT_MS))
+      ]);
+      if (late?.id) {
+        firestorePedidoOk = true;
+        console.log(`✅ Firestore confirmó tarde (id=${late.id}) para ${telefono}`);
+      }
+    }
   } catch (err) {
     console.error("❌ confirmarPedido Firestore:", err?.message || err);
   }
@@ -2759,15 +2917,43 @@ Fecha: ${new Date().toLocaleString()}
     console.error("❌ confirmarPedido pedidos.txt:", err?.message || err);
   }
 
-  if (!firestorePedidoOk) {
-    await alertarPedidoSoloLocal(sock, {
+  if (!firestorePedidoOk && !pedidoLocalOk) {
+    await alertarPedidoSinPersistencia(sock, {
       from,
       quien,
       telefono,
       resumen: resumen || lineaPizzaEmoji(estado) || "Pedido",
-      motivo: pedidoLocalOk ? "firestore_fail_local_ok" : "firestore_fail"
+      orderKey
     });
+    estado._confirmandoPedido = false;
+    await sendText(
+      sock,
+      from,
+      estado,
+      "⚠️ Hubo un problema guardando tu pedido.\nPor favor escribe de nuevo o llama al local para confirmarlo 🍕"
+    );
+    return;
   }
+
+  if (!firestorePedidoOk) {
+    if (firestoreTimedOut && pedidoLocalOk) {
+      registrarEventoMetricas("firestore_lento_sin_confirmar", {
+        from,
+        telefono,
+        orderKey: orderKey || null
+      }).catch(() => {});
+    } else if (!firestoreTimedOut) {
+      await alertarPedidoSoloLocal(sock, {
+        from,
+        quien,
+        telefono,
+        resumen: resumen || lineaPizzaEmoji(estado) || "Pedido",
+        motivo: pedidoLocalOk ? "firestore_fail_local_ok" : "firestore_fail"
+      });
+    }
+  }
+
+  await marcarPedidoConfirmadoKey(orderKey, { from, telefono, total });
 
   estado._pedidoConfirmadoAt = Date.now();
   estado._confirmandoPedido = false;
@@ -2785,6 +2971,7 @@ Fecha: ${new Date().toLocaleString()}
       tgTexto: payload
     });
     await registrarEventoMetricas("pedido_confirmado_paso_humano", { from });
+    await borrarSnapshotCritico(from).catch(() => {});
   } catch (err) {
     console.error("❌ confirmarPedido notificaciones:", err?.message || err);
   }
@@ -3383,6 +3570,213 @@ async function rotarArchivoSiGrande(filePath) {
   }
 }
 
+function clavePedidoConfirmado(from, msgId) {
+  if (!from || !msgId) return null;
+  return `${from}|${msgId}`;
+}
+
+function docIdFirestoreSeguro(key) {
+  return crypto.createHash("sha256").update(String(key)).digest("hex").slice(0, 40);
+}
+
+async function pedidoConfirmadoKeyYaExiste(orderKey) {
+  if (!orderKey) return false;
+  const docId = docIdFirestoreSeguro(orderKey);
+  if (firestore) {
+    try {
+      const snap = await firestore.collection("pedidos_confirmados_keys").doc(docId).get();
+      if (snap.exists) return true;
+    } catch (err) {
+      console.warn("⚠️ pedidoConfirmadoKeyYaExiste Firestore:", err?.message || err);
+    }
+  }
+  try {
+    const raw = await fsp.readFile(CONFIRM_KEYS_LOCAL, "utf8");
+    return raw.split(/\r?\n/).some((l) => l.trim() === orderKey);
+  } catch (err) {
+    if (err?.code !== "ENOENT") console.warn("⚠️ confirm keys local:", err?.message || err);
+  }
+  return false;
+}
+
+async function marcarPedidoConfirmadoKey(orderKey, meta = {}) {
+  if (!orderKey) return;
+  const docId = docIdFirestoreSeguro(orderKey);
+  const row = {
+    orderKey,
+    ...meta,
+    at: Date.now(),
+    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000
+  };
+  if (firestore) {
+    firestore
+      .collection("pedidos_confirmados_keys")
+      .doc(docId)
+      .set(row)
+      .catch((err) =>
+        console.warn("⚠️ marcarPedidoConfirmadoKey Firestore:", err?.message || err)
+      );
+  }
+  try {
+    await fsp.mkdir(".cache", { recursive: true });
+    await fsp.appendFile(CONFIRM_KEYS_LOCAL, orderKey + "\n", "utf8");
+  } catch (err) {
+    console.warn("⚠️ marcarPedidoConfirmadoKey local:", err?.message || err);
+  }
+}
+
+function direccionResumenEstado(estado) {
+  if (estado.tipoServicio === "domicilio") {
+    return (
+      estado.direccionCompleta ||
+      [estado.dirCalle, estado.dirEntre, estado.dirReferencia].filter(Boolean).join(" | ") ||
+      null
+    );
+  }
+  if (estado.tipoServicio === "recoger") return "Recoger en tienda";
+  return null;
+}
+
+function snapshotCriticoPayload(from, estado) {
+  const { total } = subtotalesPedidoActuales(estado);
+  const now = Date.now();
+  return {
+    from,
+    pasoPedido: estado.pasoPedido,
+    carrito: snapshotPedido(estado),
+    total,
+    direccion: direccionResumenEstado(estado),
+    metodoPago: estado.formaPago || null,
+    pagoCon: estado.pagoCon ?? null,
+    tipoServicio: estado.tipoServicio || null,
+    dirCalle: estado.dirCalle || null,
+    dirEntre: estado.dirEntre || null,
+    dirReferencia: estado.dirReferencia || null,
+    direccionCompleta: estado.direccionCompleta || null,
+    timestamp: now,
+    expiresAt: now + SNAPSHOT_CRITICO_TTL_MS
+  };
+}
+
+function aplicarSnapshotPedidoAEstado(estado, snap) {
+  if (!snap) return;
+  const c = snap.carrito || snap;
+  if (Array.isArray(c.ingredientes)) estado.ingredientes = [...c.ingredientes];
+  if (c.tamano) estado.tamano = c.tamano;
+  estado.complementos = { ...(c.complementos || {}) };
+  estado.lineasComplemento = Array.isArray(c.lineasComplemento)
+    ? c.lineasComplemento.map((x) => ({ ...x }))
+    : [];
+  estado.lineasBebida = Array.isArray(c.lineasBebida)
+    ? c.lineasBebida.map((x) => ({ ...x }))
+    : [];
+  estado.extrasActivos = { ...(c.extrasActivos || {}) };
+  estado.extrasTotal = Number(c.extrasTotal || 0);
+  estado.extrasLineas = [...(c.extrasLineas || [])];
+}
+
+async function persistirSnapshotCritico(from, estado) {
+  if (!["G", "H", "I"].includes(estado.pasoPedido)) return;
+  const payload = snapshotCriticoPayload(from, estado);
+  const docId = docIdFirestoreSeguro(from);
+  if (firestore) {
+    try {
+      await firestore.collection("pedidos_snapshot_critico").doc(docId).set(payload);
+    } catch (err) {
+      console.warn("⚠️ persistirSnapshotCritico Firestore:", err?.message || err);
+    }
+  }
+  try {
+    await fsp.mkdir(SNAPSHOT_CRITICO_DIR, { recursive: true });
+    await fsp.writeFile(
+      `${SNAPSHOT_CRITICO_DIR}/${docId}.json`,
+      JSON.stringify(payload),
+      "utf8"
+    );
+  } catch (err) {
+    console.warn("⚠️ persistirSnapshotCritico local:", err?.message || err);
+  }
+}
+
+async function leerSnapshotCritico(from) {
+  const docId = docIdFirestoreSeguro(from);
+  if (firestore) {
+    try {
+      const snap = await firestore.collection("pedidos_snapshot_critico").doc(docId).get();
+      if (snap.exists) return snap.data();
+    } catch (err) {
+      console.warn("⚠️ leerSnapshotCritico Firestore:", err?.message || err);
+    }
+  }
+  try {
+    const raw = await fsp.readFile(`${SNAPSHOT_CRITICO_DIR}/${docId}.json`, "utf8");
+    return JSON.parse(raw);
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      console.warn("⚠️ leerSnapshotCritico local:", err?.message || err);
+    }
+  }
+  return null;
+}
+
+async function restaurarSnapshotCriticoEnEstado(from, estado) {
+  if (estado.pasoPedido && ["G", "H", "I"].includes(estado.pasoPedido)) return false;
+  const snap = await leerSnapshotCritico(from);
+  if (!snap || !snap.expiresAt || snap.expiresAt < Date.now()) return false;
+  if (!["G", "H", "I"].includes(snap.pasoPedido)) return false;
+  aplicarSnapshotPedidoAEstado(estado, snap);
+  estado.pasoPedido = snap.pasoPedido;
+  estado.formaPago = snap.metodoPago || null;
+  estado.pagoCon = snap.pagoCon ?? null;
+  estado.tipoServicio = snap.tipoServicio || estado.tipoServicio;
+  estado.dirCalle = snap.dirCalle ?? estado.dirCalle;
+  estado.dirEntre = snap.dirEntre ?? estado.dirEntre;
+  estado.dirReferencia = snap.dirReferencia ?? estado.dirReferencia;
+  estado.direccionCompleta = snap.direccionCompleta ?? estado.direccionCompleta;
+  if (snap.pasoPedido === "G") estado.pendienteEnvioConfirmacion = true;
+  console.log("[Carly] snapshot crítico restaurado", from, snap.pasoPedido);
+  return true;
+}
+
+async function borrarSnapshotCritico(from) {
+  const docId = docIdFirestoreSeguro(from);
+  if (firestore) {
+    firestore
+      .collection("pedidos_snapshot_critico")
+      .doc(docId)
+      .delete()
+      .catch(() => {});
+  }
+  try {
+    await fsp.unlink(`${SNAPSHOT_CRITICO_DIR}/${docId}.json`);
+  } catch (_) {}
+}
+
+async function alertarPedidoSinPersistencia(sock, { from, quien, telefono, resumen, orderKey }) {
+  const meta = {
+    from,
+    telefono: telefono || String(from || "").replace(/@.+$/, ""),
+    quien: quien || "Cliente",
+    resumen: String(resumen || "").slice(0, 240),
+    orderKey: orderKey || null
+  };
+  console.error("🚨🚨 [Carly] PEDIDO SIN PERSISTENCIA — acción inmediata", meta);
+  try {
+    await registrarEventoMetricas("pedido_sin_persistencia", meta);
+  } catch (_) {}
+  if (!sock) return;
+  const detalle = `🚨🚨 *PEDIDO SIN PERSISTENCIA*\n📞 ${meta.quien}\nJID: ${from}\n${meta.resumen ? `📋 ${meta.resumen}\n` : ""}Revisar YA — no quedó en Firestore ni pedidos.txt`;
+  try {
+    await notificarUrgenteMovil(sock, {
+      waTitulo: "PEDIDO SIN PERSISTENCIA",
+      waDetalle: detalle,
+      tgTexto: detalle
+    });
+  } catch (err) {
+    console.error("❌ alertarPedidoSinPersistencia notify:", err?.message || err);
+  }
+}
+
 async function alertarPedidoSoloLocal(sock, { from, quien, telefono, resumen, motivo }) {
   const meta = {
     from,
@@ -3447,15 +3841,16 @@ async function registrarEventoMetricas(evento, payload = {}) {
  * cliente, telefono, pedido, total, estado("pendiente"), fecha(Timestamp actual)
  */
 async function guardarPedido(pedido) {
+  let operacion = null;
   try {
     if (!firestore) {
       console.warn("⚠️ Firestore no disponible. No se guardó el pedido.");
-      return null;
+      return { id: null, timedOut: false, error: true };
     }
 
     if (!pedido || typeof pedido !== "object") {
       console.warn("⚠️ guardarPedido: payload inválido (no es objeto).");
-      return null;
+      return { id: null, timedOut: false, error: true };
     }
 
     const cliente = String(pedido.cliente || "").trim();
@@ -3465,15 +3860,15 @@ async function guardarPedido(pedido) {
 
     if (!cliente || !telefono) {
       console.warn("⚠️ guardarPedido: faltan campos cliente/telefono.");
-      return null;
+      return { id: null, timedOut: false, error: true };
     }
     if (pedidoContenido == null || (typeof pedidoContenido === "string" && !pedidoContenido.trim())) {
       console.warn("⚠️ guardarPedido: campo pedido vacío.");
-      return null;
+      return { id: null, timedOut: false, error: true };
     }
     if (!Number.isFinite(total) || total <= 0) {
       console.warn("⚠️ guardarPedido: total inválido o <= 0.");
-      return null;
+      return { id: null, timedOut: false, error: true };
     }
 
     const doc = {
@@ -3485,7 +3880,7 @@ async function guardarPedido(pedido) {
       fecha: new Date()
     };
 
-    const operacion = firestore.collection("pedidos").add(doc);
+    operacion = firestore.collection("pedidos").add(doc);
     let timeoutHandle;
     const timeoutPromise = new Promise((_, reject) => {
       timeoutHandle = setTimeout(
@@ -3496,20 +3891,23 @@ async function guardarPedido(pedido) {
     let ref;
     try {
       ref = await Promise.race([operacion, timeoutPromise]);
+      console.log(`✅ Pedido guardado en Firestore (id=${ref.id}) para ${cliente}.`);
+      return { id: ref.id, timedOut: false, error: false };
     } finally {
       clearTimeout(timeoutHandle);
     }
-    console.log(`✅ Pedido guardado en Firestore (id=${ref.id}) para ${cliente}.`);
-    return ref.id;
   } catch (err) {
     if (err?.message === "GUARDAR_PEDIDO_TIMEOUT") {
       console.error(
-        `❌ guardarPedido: timeout (>${GUARDAR_PEDIDO_TIMEOUT_MS}ms) — continúa flujo local`
+        `❌ guardarPedido: timeout (>${GUARDAR_PEDIDO_TIMEOUT_MS}ms) — esperando confirmación tardía`
       );
-    } else {
-      console.error("❌ guardarPedido: error guardando en Firestore:", err?.message || err);
+      const latePromise = operacion
+        .then((r) => ({ id: r.id, late: true }))
+        .catch(() => null);
+      return { id: null, timedOut: true, error: false, latePromise };
     }
-    return null;
+    console.error("❌ guardarPedido: error guardando en Firestore:", err?.message || err);
+    return { id: null, timedOut: false, error: true };
   }
 }
 
@@ -4757,13 +5155,20 @@ async function derivarPedidoAHumano(sock, from, estado, quien, detalle = "") {
   const telefonoDerivado = String(from || "").replace(/@.+$/, "");
   try {
     const { precioPizza, cb, ext, total } = subtotalesPedidoActuales(estado);
-    const idFirestore = await guardarPedido({
+    const fsRes = await guardarPedido({
       cliente: quien || "Cliente",
       telefono: telefonoDerivado,
       pedido: resumen || lineaPizzaEmoji(estado) || "Pedido",
       total: Number(total || precioPizza || 0)
     });
-    firestoreDerivadoOk = !!idFirestore;
+    firestoreDerivadoOk = !!fsRes?.id;
+    if (!firestoreDerivadoOk && fsRes?.timedOut && fsRes?.latePromise) {
+      const late = await Promise.race([
+        fsRes.latePromise,
+        new Promise((r) => setTimeout(() => r(null), FIRESTORE_LATE_WAIT_MS))
+      ]);
+      firestoreDerivadoOk = !!late?.id;
+    }
   } catch (err) {
     console.error("❌ Error guardando pedido derivado en Firestore:", err?.message || err);
   }
@@ -4790,13 +5195,21 @@ Fecha: ${new Date().toLocaleString()}
     console.error("❌ Error guardando pedido derivado local:", err?.message || err);
   }
 
-  if (!firestoreDerivadoOk) {
+  if (!firestoreDerivadoOk && !pedidoDerivadoLocalOk) {
+    await alertarPedidoSinPersistencia(sock, {
+      from,
+      quien,
+      telefono: telefonoDerivado,
+      resumen: resumen || lineaPizzaEmoji(estado) || "Pedido",
+      orderKey: null
+    });
+  } else if (!firestoreDerivadoOk && pedidoDerivadoLocalOk) {
     await alertarPedidoSoloLocal(sock, {
       from,
       quien,
       telefono: telefonoDerivado,
       resumen: resumen || lineaPizzaEmoji(estado) || "Pedido",
-      motivo: pedidoDerivadoLocalOk ? "firestore_fail_local_ok" : "firestore_fail"
+      motivo: "firestore_fail_local_ok"
     });
   }
 
@@ -4896,8 +5309,11 @@ async function startBot() {
   await botConfigStore.loadFromFirestore();
   aplicarBotConfigAMemoria(botConfigStore.getConfig());
 
-  sheetsCache.clear();
   menu = await cargarMenu();
+  if (Object.keys(menu).length === 0) {
+    const fbMenu = await cargarMenuFallback();
+    if (Object.keys(fbMenu).length > 0) menu = fbMenu;
+  }
   const comp = await cargarComplementos();
   complementosItems = comp.items;
   complementosMenu = comp.menu;
@@ -5077,6 +5493,9 @@ async function procesarMensajeUpsert(sock, msg) {
   }
 
   const estado = estados[from];
+  if (msgId) estado._ultimoMsgId = msgId;
+  await restaurarSnapshotCriticoEnEstado(from, estado);
+
   if (mensajeYaProcesado(estado, msgId)) {
     console.log("[Carly] mensaje duplicado ignorado", msgId || "?");
     return;
@@ -5157,6 +5576,10 @@ async function procesarMensajeUpsert(sock, msg) {
             cantidad: st._pendingMessages.length,
             max: MAX_PENDING_MESSAGES
           }).catch(() => {});
+          if (!st._avisoColaLlenaEnviado) {
+            st._avisoColaLlenaEnviado = true;
+            sendText(sock, from, st, MENSAJE_COLA_SATURADA).catch(() => {});
+          }
         }
       }
       return;
