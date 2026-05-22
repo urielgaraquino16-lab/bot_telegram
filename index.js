@@ -30,6 +30,9 @@ const groqCarlyLite = require("./groq-carly-lite");
 const promoImagenes = require("./promo-imagenes");
 const pagoCarly = require("./pago-carly");
 const consultasCarly = require("./consultas-carly");
+const botLogger = require("./bot-logger");
+const carritoEdiciones = require("./carrito-ediciones");
+const mensajesCarly = require("./mensajes-carly");
 const RESPUESTA_LOCAL_YA_ENVIADA = "__RESPUESTA_LOCAL_YA_ENVIADA__";
 
 // Firestore (opcional). Si falta clave.json o falla la inicialización, el bot
@@ -480,6 +483,7 @@ async function recargarRestauranteSiCambioAsync() {
       restauranteMtimeMs = mtimeMs;
       restaurante = cargarRestaurante();
       aplicarBotConfigAMemoria(botConfigStore.getConfig());
+      if (typeof initCarritoEdiciones === "function") initCarritoEdiciones();
       initCarlyIntents();
       initPagoCarly();
       initConsultasCarly();
@@ -1012,124 +1016,19 @@ function esNegacionSimple(textoClean) {
 }
 
 function textoPideVerCarrito(textoClean) {
-  const x = sinAcentos(normalizarTextoPedido(textoClean));
-  return (
-    /(carrito|resumen|total|cu[aá]nto\s+va|cuanto\s+llevo|que\s+llevo|pedido\s+actual)/.test(x)
-  );
+  return carritoEdiciones.textoPideVerCarrito(textoClean);
 }
 
 function textoPideAgregarMasNatural(textoClean) {
-  const x = sinAcentos(normalizarTextoPedido(textoClean));
-  return (
-    esAfirmacionSimple(x) ||
-    /(agrega|agregame|agregale|tambien|y\s+una|y\s+un|quiero\s+otra|quiero\s+otro)/.test(x)
-  );
+  return carritoEdiciones.textoPideAgregarMasNatural(textoClean);
 }
 
 function hayContenidoCarrito(estado) {
-  return (
-    (estado.ingredientes?.length || 0) > 0 ||
-    Object.keys(estado.complementos || {}).length > 0 ||
-    (estado.lineasComplemento?.length || 0) > 0 ||
-    (estado.lineasBebida?.length || 0) > 0
-  );
-}
-
-function quitarComplementoDelEstado(estado, nombre) {
-  let removido = false;
-  if (estado.complementos && estado.complementos[nombre]) {
-    delete estado.complementos[nombre];
-    removido = true;
-  }
-  if (Array.isArray(estado.lineasComplemento)) {
-    const before = estado.lineasComplemento.length;
-    estado.lineasComplemento = estado.lineasComplemento.filter((L) => L.nombre !== nombre);
-    removido = removido || before !== estado.lineasComplemento.length;
-  }
-  return removido;
-}
-
-function quitarBebidaDelEstado(estado, nombre) {
-  if (!Array.isArray(estado.lineasBebida)) return false;
-  const before = estado.lineasBebida.length;
-  estado.lineasBebida = estado.lineasBebida.filter((L) => L.nombre !== nombre);
-  return before !== estado.lineasBebida.length;
-}
-
-function duplicarUltimoArticulo(estado) {
-  if (Array.isArray(estado.lineasBebida) && estado.lineasBebida.length > 0) {
-    const last = estado.lineasBebida[estado.lineasBebida.length - 1];
-    last.cantidad = Number(last.cantidad || 0) + 1;
-    return `✅ Sumé 1 más de *${last.nombre}* (ahora x${last.cantidad}).`;
-  }
-  if (Array.isArray(estado.lineasComplemento) && estado.lineasComplemento.length > 0) {
-    const last = estado.lineasComplemento[estado.lineasComplemento.length - 1];
-    last.cantidad = Number(last.cantidad || 0) + 1;
-    if (estado.complementos && estado.complementos[last.nombre] != null) {
-      estado.complementos[last.nombre] = Number(estado.complementos[last.nombre] || 0) + 1;
-    }
-    return `✅ Sumé 1 más de *${last.nombre}* (ahora x${last.cantidad}).`;
-  }
-  if (Array.isArray(estado.ingredientes) && estado.ingredientes.length > 0) {
-    return "🍕 Para pizza no duplico automático; dime si quieres *otra pizza* y te la agrego con asesor.";
-  }
-  return null;
+  return carritoEdiciones.hayContenidoCarrito(estado);
 }
 
 function aplicarEdicionCarritoNatural(estado, textoClean) {
-  const x = sinAcentos(normalizarTextoPedido(textoClean));
-  if (!x || !hayContenidoCarrito(estado)) return null;
-
-  // Cambiar tamaño de pizza por texto libre.
-  if (/(cambia|cambiar|pon|quiero)\s+.*(mediana|grande|familiar|jumbo|mega)/.test(x)) {
-    const t = detectarTamano(x);
-    if (t) {
-      estado.tamano = t;
-      recalcularExtrasTotal(estado);
-      return `✅ Tamaño actualizado a *${t}*.`;
-    }
-  }
-
-  // Cambiar sabor de pizza en caliente (si ya hay pizza)
-  if (/(cambia|mejor|pon|quiero)\b/.test(x) && /(pizza|sabor)/.test(x)) {
-    const nuevos = detectarIngredientes(x);
-    if (nuevos.length > 0) {
-      estado.ingredientes = nuevos.slice(0, 2);
-      return `✅ Actualicé el sabor a *${estado.ingredientes.join(" / ")}*.`;
-    }
-  }
-
-  // Quitar elementos.
-  if (/(quita|quitar|elimina|borrar|sin)\b/.test(x)) {
-    const pick = resolverItemCatalogoPorNumeroONombre(x);
-    if (pick?.tipo === "comp") {
-      const ok = quitarComplementoDelEstado(estado, pick.nombre);
-      if (ok) return `✅ Quité *${pick.nombre}* del pedido.`;
-    }
-    if (pick?.tipo === "bebida") {
-      const ok = quitarBebidaDelEstado(estado, pick.nombre);
-      if (ok) return `✅ Quité *${pick.nombre}* del pedido.`;
-    }
-    if (/(pizza|sabor)/.test(x) && estado.ingredientes?.length) {
-      estado.ingredientes = [];
-      estado.tamano = null;
-      return "✅ Quité la pizza actual del pedido.";
-    }
-    if (/bebida/.test(x)) {
-      if (Array.isArray(estado.lineasBebida) && estado.lineasBebida.length > 0) {
-        estado.lineasBebida = [];
-        return "✅ Quité las bebidas del pedido.";
-      }
-    }
-    return "No encontré ese artículo para quitar. Dime el nombre exacto del producto.";
-  }
-
-  // Duplicar último artículo agregado.
-  if (/(duplica|doble|otra igual|sumale una|sumale uno)/.test(x)) {
-    return duplicarUltimoArticulo(estado);
-  }
-
-  return null;
+  return carritoEdiciones.aplicarEdicionCarritoNatural(estado, textoClean);
 }
 
 async function sendText(sock, to, estado, text) {
@@ -1357,7 +1256,7 @@ REGLAS:
 }
 
 function sugerirPizzaSimilar(texto) {
-  const ings = detectarIngredientes(texto);
+  const ings = detectarIngredientes(texto, { permitirFuzzy: true });
   if (ings.length && menu[ings[0]]) return ings[0];
   const t = sinAcentos(normalizarTextoPedido(texto));
   const pizzas = Object.keys(menu || {});
@@ -1379,9 +1278,186 @@ function sugerirPizzaSimilar(texto) {
 }
 
 function detectarInicioPedido(textoClean) {
-  return /(pedido|ordenar|quiero pizza|una pizza|hacer pedido|comprar pizza)/.test(
+  const x = textoClean;
+  if (/(pedido|ordenar|hacer pedido|comprar pizza)/.test(x)) return true;
+  if (/\b(me manda|manden|mandame|envien|envío|envio)\b/.test(x)) return true;
+  if (/\b(quiero|dame|necesito|ponme)\b/.test(x) && /\b(pizza|pedido|ordenar)\b/.test(x)) {
+    return true;
+  }
+  if (
+    /\b(quiero|dame|necesito)\b/.test(x) &&
+    detectarIngredientes(x, { permitirFuzzy: true }).length > 0
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function detectarQuierePedirTrasPrecio(textoClean) {
+  return /\b(me la manda|me mandan|manda una|manden|mandame|enviar|envío|envio|la quiero|la pido)\b/.test(
     textoClean
   );
+}
+
+function snapshotPedidoCarly(estado) {
+  return {
+    paso: estado.pasoPedido || null,
+    ings: (estado.ingredientes || []).join("|"),
+    tam: estado.tamano || null,
+    tipo: estado.tipoServicio || null,
+    sub: estado.subPasoDireccion || null
+  };
+}
+
+function textoAyudaPasoPedido(estado) {
+  const p = estado.pasoPedido;
+  const map = {
+    A: "🍕 ¿De qué *sabor*? (ej. hawaiana, peperoni…)",
+    B: "📏 ¿Qué *tamaño*? (mediana, grande, familiar…)",
+    C: "🍕 ¿Algún *extra* en la pizza? (orilla de queso, masa delgada…) o escribe *siguiente*",
+    D: "🍟 ¿*Complementos* o *bebidas*? Escribe el nombre o *no* / *siguiente*",
+    E: "🛵 Responde *domicilio* o *recoger* en tienda",
+    F: estado.subPasoDireccion === "entre"
+      ? "📍 ¿*Entre qué calles*?"
+      : estado.subPasoDireccion === "referencia"
+        ? "📍 ¿*Referencia* o color de casa?"
+        : "📍 ¿*Calle y número*?",
+    G: "✅ Revisa el resumen y responde *SÍ* para continuar con el pago",
+    H: "💳 ¿Pago *efectivo* o *transferencia*?",
+    I: "💵 ¿Con cuánto vas a pagar? (solo número)"
+  };
+  return map[p] || `📋 Paso *${p}*: escribe el dato que falta o *cancelar*.`;
+}
+
+async function intentarContextoPedidoLocal(sock, from, estado, textoClean) {
+  if (hayContenidoCarrito(estado)) {
+    const edCarrito = aplicarEdicionCarritoNatural(estado, textoClean);
+    if (edCarrito) {
+      await sendText(sock, from, estado, edCarrito);
+      return true;
+    }
+  }
+
+  if (estado.esperandoSaborParaPrecio) {
+    const ings = detectarIngredientes(textoClean, { permitirFuzzy: true });
+    if (ings.length >= 1 && menu[ings[0]]) {
+      const tam = estado.esperandoSaborParaPrecio;
+      estado.esperandoSaborParaPrecio = null;
+      const pr = menu[ings[0]][tam];
+      if (pr != null) {
+        estado.precioConsultaReciente = { sabor: ings[0], tamano: tam, precio: pr };
+        await sendText(
+          sock,
+          from,
+          estado,
+          `💲 *${capitalizar(ings[0])}* ${tam}: *$${pr}*\n\n¿La pides? Escribe *quiero ${ings[0]} ${tam}* o *me la mandan* 🍕`
+        );
+        return true;
+      }
+    }
+  }
+
+  if (
+    estado.pasoPedido &&
+    !hayContenidoCarrito(estado) &&
+    /(que sea|pero era|pero es|cambia|cambio|mejor pon|quiero la|quiero una)\b/.test(textoClean)
+  ) {
+    const ings = detectarIngredientes(textoClean, { permitirFuzzy: true });
+    if (ings.length === 1 && menu[ings[0]]) {
+      estado.ingredientes = [ings[0]];
+      const lineas = [`Pizza: *${capitalizar(ings[0])}*`];
+      if (estado.tamano) lineas.push(`Tamaño: *${estado.tamano}*`);
+      const pie = (() => {
+        const { total } = subtotalesPedidoActuales(estado);
+        return total > 0 ? `💰 Total: *$${total}*` : "";
+      })();
+      await sendText(sock, from, estado, mensajesCarly.mensajeEntendiCambio(lineas, pie));
+      botLogger.carrito("cambio_sabor_paso", { sabor: ings[0], paso: estado.pasoPedido });
+      return true;
+    }
+  }
+
+  if (detectarQuierePedirTrasPrecio(textoClean)) {
+    const ings = detectarIngredientes(textoClean, { permitirFuzzy: true });
+    const sabor = ings[0] || estado.precioConsultaReciente?.sabor;
+    const tam =
+      detectarTamano(textoClean) ||
+      estado.precioConsultaReciente?.tamano ||
+      estado.tamano;
+    if (sabor && menu[sabor]) {
+      estado.ingredientes = [sabor];
+      if (tam && menu[sabor][tam]) estado.tamano = tam;
+      estado.pasoPedido = estado.tamano ? "D" : "B";
+      estado.precioConsultaReciente = null;
+      botLogger.estado("pedir_tras_precio", { sabor, tamano: estado.tamano, paso: estado.pasoPedido });
+      return false;
+    }
+  }
+
+  if (estado.pasoPedido && esConsultaPrecio(textoClean)) {
+    const r = resolverConsultaPrecio(textoClean, estado);
+    if (r) {
+      await sendText(sock, from, estado, r);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function responderAvanceFlujoPedido(sock, from, estado, antes) {
+  const p = estado.pasoPedido;
+  if (!p) return false;
+  const pasoCambio = antes.paso !== p;
+  const ings = estado.ingredientes?.[0];
+
+  if (p === "B" && pasoCambio && ings) {
+    await sendText(
+      sock,
+      from,
+      estado,
+      `✅ *${capitalizar(ings)}* anotada.\n\n${textoPreciosTamanoParaPizza(ings)}`
+    );
+    return true;
+  }
+  if (p === "C" && pasoCambio && ings && estado.tamano) {
+    await sendText(
+      sock,
+      from,
+      estado,
+      `✅ *${capitalizar(ings)}* *${estado.tamano}*.\n\n🍕 ¿Algún *extra*? (orilla de queso, masa delgada…) o escribe *siguiente* para complementos.`
+    );
+    return true;
+  }
+  if (p === "D" && pasoCambio) {
+    const extra = String(restaurante.upsell?.alConfirmarPizza?.texto || "").trim();
+    await sendText(
+      sock,
+      from,
+      estado,
+      `🍟 ¿*Complementos* o 🥤 *bebidas*? Escribe el nombre o *no* / *siguiente*.${extra ? `\n${extra}` : ""}`
+    );
+    return true;
+  }
+  if (p === "E" && pasoCambio && !estado.tipoServicio) {
+    await sendText(sock, from, estado, "🛵 ¿*Domicilio* o *recoger* en tienda?");
+    return true;
+  }
+  if (p === "F" && estado.tipoServicio === "domicilio") {
+    if (estado.subPasoDireccion === "calle" && antes.sub !== "calle") {
+      await sendText(sock, from, estado, "📍 ¿*Calle y número* de entrega?");
+      return true;
+    }
+    if (estado.subPasoDireccion === "entre" && antes.sub !== "entre") {
+      await sendText(sock, from, estado, "📍 ¿*Entre qué calles*?");
+      return true;
+    }
+    if (estado.subPasoDireccion === "referencia" && antes.sub !== "referencia") {
+      await sendText(sock, from, estado, "📍 ¿*Referencia* o color de casa?");
+      return true;
+    }
+  }
+  return false;
 }
 
 function detectarCantidadEnTexto(textoClean) {
@@ -1787,6 +1863,7 @@ function initFuzzyCarly() {
     esConsultaPrecio,
     esPreguntaRebanadas,
     esPreguntaIngredientesPizza,
+    esConsultaMenuSalsasAlitas,
     detectarInicioPedido,
     mergeExtrasEnEstado,
     esAfirmacionSimple,
@@ -1970,11 +2047,13 @@ async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto
   const edicion = aplicarEdicionCarritoNatural(estado, textoClean);
   if (edicion) return edicion;
 
-  const precio = resolverConsultaPrecio(textoClean);
+  const precio = resolverConsultaPrecio(textoClean, estado);
   if (precio) return precio;
 
-  const descLocal = textoDescripcionLocalPizza(textoClean);
-  if (descLocal) return descLocal;
+  if (esPreguntaIngredientesPizza(textoClean)) {
+    const descLocal = textoDescripcionLocalPizza(textoClean);
+    if (descLocal) return descLocal;
+  }
 
   if (/(promo|promocion|oferta)\b/.test(textoClean) && !estado.pasoPedido) {
     await enviarPromosAlCliente(sock, from, estado, obtenerPromosVigentes());
@@ -2011,8 +2090,28 @@ async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto
   return null;
 }
 
+function intentarAclaracionAmbigua(textoClean, estado) {
+  const x = sinAcentos(normalizarTextoPedido(textoClean));
+  if (!x || ["G", "H", "I"].includes(estado.pasoPedido)) return null;
+
+  if (estado.pasoPedido && estado.pasoPedido !== "E" && esAfirmacionSimple(x)) {
+    return `😊 Para seguir bien:\n${textoAyudaPasoPedido(estado)}`;
+  }
+
+  if (!estado.pasoPedido && !estado.confirmacionPendiente) {
+    const ings = detectarIngredientes(x, { permitirFuzzy: false });
+    if (ings.length >= 2 && !/(mitad|y\s+mitad|dos\s*sabor)/.test(x)) {
+      botLogger.cliente("ambiguedad_dos_sabores", { sabores: ings.join("|") });
+      return `🍕 ¿Es *mitad y mitad* (${capitalizar(ings[0])} y ${capitalizar(ings[1])}) o solo una pizza?\nDime cuál 😊`;
+    }
+  }
+
+  return null;
+}
+
 function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
   if (!textoClean) return;
+  const pasoAnt = estado.pasoPedido || null;
 
   if (!estado.pasoPedido && detectarInicioPedido(textoClean)) {
     estado.pasoPedido = "A";
@@ -2029,13 +2128,20 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       estado.pizzaSugerida = null;
       return;
     }
-    const ings = detectarIngredientes(textoClean);
+    const ings = detectarIngredientes(textoClean, { permitirFuzzy: true });
+    const tam = detectarTamano(textoClean);
     if (ings.length) {
       const validos = ings.filter((i) => menu[i]);
       if (validos.length) {
         estado.ingredientes = validos.slice(0, 2);
         estado.pizzaSugerida = null;
-        estado.pasoPedido = "B";
+        const pizza0 = validos[0];
+        if (tam && menu[pizza0]?.[tam]) {
+          estado.tamano = tam;
+          estado.pasoPedido = "C";
+        } else {
+          estado.pasoPedido = "B";
+        }
       } else {
         const sug = sugerirPizzaSimilar(textoClean);
         if (sug) {
@@ -2126,6 +2232,11 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       estado.pendienteEnvioConfirmacion = true;
     }
   }
+
+  const pasoNuevo = estado.pasoPedido || null;
+  if (pasoAnt !== pasoNuevo) {
+    botLogger.estado("paso_pedido", { de: pasoAnt, a: pasoNuevo, servicio: estado.tipoServicio || null });
+  }
 }
 
 function marcarPasoConfirmacionPedido(estado) {
@@ -2146,9 +2257,10 @@ function respuestaFallbackSinGroq(estado, textoClean) {
   const promos = obtenerPromosVigentes();
   if (promos.length === 1) {
     const p = promos[0];
-    partes.push(
-      `🔥 Hoy: *${p.titulo || "promo"}* — ${String(formatearTextoPromoCliente(p) || "").slice(0, 120)}`
-    );
+    const det = textoPromoCortoParaCliente(p);
+    if (det) {
+      partes.push(`🔥 Hoy: *${p.titulo || "promo"}* — ${det}`);
+    }
   }
   if (estado?.pasoPedido && estado.pasoPedido !== "G") {
     partes.push(
@@ -2160,10 +2272,22 @@ function respuestaFallbackSinGroq(estado, textoClean) {
 
 async function manejarFalloGroqOSinIA(sock, from, estado, quien, motivo = "") {
   const fb = respuestaFallbackSinGroq(estado, motivo);
-  const escalado = mensajeEscaladoParaCliente();
-  const texto = fb ? `${escalado}\n\n${fb}` : escalado;
-  await sendText(sock, from, estado, texto);
-  await activarModoHumano(sock, from, estado, quien, motivo, { skipMensajeCliente: true });
+  const esRateLimit =
+    motivo === GROQ_RATE_LIMIT_SENTINEL || /rate.?limit|429|cuota/i.test(String(motivo || ""));
+
+  if (esRateLimit) {
+    const texto = fb ? `${mensajeEscaladoParaCliente()}\n\n${fb}` : mensajeEscaladoParaCliente();
+    await sendText(sock, from, estado, texto);
+    await activarModoHumano(sock, from, estado, quien, motivo, { skipMensajeCliente: true });
+    return;
+  }
+
+  if (fb) {
+    await sendText(sock, from, estado, fb);
+  } else {
+    await sendText(sock, from, estado, mensajeEscaladoParaCliente());
+    await activarModoHumano(sock, from, estado, quien, motivo, { skipMensajeCliente: true });
+  }
 }
 
 function jidEsAdmin(jid) {
@@ -2289,7 +2413,25 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     }
   }
 
+  const snapPedidoAntes = snapshotPedidoCarly(estado);
   actualizarEstadoDesdeMensaje(estado, texto, textoClean);
+
+  if (estado.pasoPedido === "E" && esAfirmacionSimple(textoClean) && !estado.tipoServicio) {
+    await sendText(
+      sock,
+      from,
+      estado,
+      "🛵 Para continuar responde *domicilio* o *recoger* en tienda (no solo sí) 😊"
+    );
+    return;
+  }
+
+  if (estado.pasoPedido && !["G", "H", "I"].includes(estado.pasoPedido)) {
+    if (await intentarContextoPedidoLocal(sock, from, estado, textoClean)) return;
+    if (await responderAvanceFlujoPedido(sock, from, estado, snapPedidoAntes)) return;
+    await sendText(sock, from, estado, textoAyudaPasoPedido(estado));
+    return;
+  }
 
   if (estado.pizzaSugerida && estado.pasoPedido === "A" && !estado.confirmacionPendiente) {
     const prop = { tipo: "pizza", ingredientes: [estado.pizzaSugerida] };
@@ -2318,6 +2460,12 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   const respRebanadas = responderConsultaRebanadas(textoClean);
   if (respRebanadas) {
     await sendText(sock, from, estado, respRebanadas);
+    return;
+  }
+
+  const aclaracion = intentarAclaracionAmbigua(textoClean, estado);
+  if (aclaracion) {
+    await sendText(sock, from, estado, aclaracion);
     return;
   }
 
@@ -2390,6 +2538,11 @@ async function activarModoHumano(sock, from, estado, quien, motivo = "", opts = 
   estado.modoHumano = true;
   estado.tiempoEscalado = Date.now();
   const detalle = String(motivo || "").trim();
+  botLogger.escalado("modo_humano", {
+    from,
+    paso: estado.pasoPedido || null,
+    motivo: detalle.slice(0, 120) || "ESCALAR"
+  });
   if (sock && from && estado && !opts.skipMensajeCliente) {
     await sendText(sock, from, estado, mensajeEscaladoParaCliente());
   }
@@ -2472,7 +2625,7 @@ function prepararContextoGroqLite(estado, textoClean) {
   const { total } = subtotalesPedidoActuales(estado);
   if (total > 0) hechos.push(`Total pedido en sistema: $${total}`);
 
-  const precioLocal = resolverConsultaPrecio(textoClean);
+  const precioLocal = resolverConsultaPrecio(textoClean, estado);
   if (precioLocal) {
     hechos.push(`PRECIO_VERIFICADO (copiar tal cual): ${precioLocal.replace(/\n+/g, " | ")}`);
   }
@@ -2782,7 +2935,7 @@ function detectarPedidoDirecto(textoClean) {
     );
   if (pareceSoloConsulta) return null;
 
-  const ingredientes = detectarIngredientes(t);
+  const ingredientes = detectarIngredientes(t, { permitirFuzzy: true });
   const tamano = detectarTamano(t);
   const direccion = detectarDireccionEnTexto(textoClean);
   const { encontrados: complementos, ambiguedades } = detectarComplementosEnTexto(t);
@@ -2852,7 +3005,9 @@ function nuevoEstadoCliente() {
     pendienteEnvioConfirmacion: false,
     confirmacionPendiente: null,
     formaPago: null,
-    pagoCon: null
+    pagoCon: null,
+    esperandoSaborParaPrecio: null,
+    precioConsultaReciente: null
   };
 }
 
@@ -3421,19 +3576,35 @@ function limpiarMetadatosPromoPedido(estado) {
   estado.referenciaPromoCliente = null;
 }
 
+function textoContienePalabraIngrediente(t, palabra) {
+  const p = sinAcentos(normalizarTextoPedido(palabra));
+  if (!p || p.length < 3) return false;
+  if (p.length >= 4) {
+    const esc = p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?:^|[^a-z0-9])${esc}(?:[^a-z0-9]|$)`).test(t);
+  }
+  return t.includes(p);
+}
+
 // 🔍 INGREDIENTES / sabores (dinámico desde `menu` + alias en `restaurant.json`)
-function detectarIngredientes(texto) {
+/** @param {object} [opts] permitirFuzzy: solo en flujo de pedido (evita "mejor"→mixta en charla casual) */
+function detectarIngredientes(texto, opts = {}) {
+  const permitirFuzzy = opts.permitirFuzzy === true;
   const t = sinAcentos(normalizarTextoPedido(texto));
   const pizzas = detectCache.pizzasOrdenadas;
   const encontrados = new Set();
 
   for (const row of detectCache.pizzasNorm) {
-    if (row.norm && t.includes(row.norm)) encontrados.add(row.raw);
+    if (row.norm && textoContienePalabraIngrediente(t, row.norm)) encontrados.add(row.raw);
   }
 
   for (const row of detectCache.aliasIngredientes) {
-    if (row.alias && t.includes(row.alias)) encontrados.add(row.canonical);
+    if (row.alias && textoContienePalabraIngrediente(t, row.alias)) {
+      encontrados.add(row.canonical);
+    }
   }
+
+  if (!permitirFuzzy) return [...encontrados];
 
   const tokens = t.split(/[^a-z0-9]+/).filter((w) => w.length >= 4);
   for (const p of pizzas) {
@@ -3441,8 +3612,8 @@ function detectarIngredientes(texto) {
     if (encontrados.has(p)) continue;
     if (!pn || pn.length < 4) continue;
     for (const w of tokens) {
-      if (Math.abs(w.length - pn.length) > 3) continue;
-      if (levenshtein(w, pn) <= 2) {
+      if (Math.abs(w.length - pn.length) > 2) continue;
+      if (levenshtein(w, pn) <= 1) {
         encontrados.add(p);
         break;
       }
@@ -3629,6 +3800,25 @@ function obtenerPromosVigentes() {
   return filtradas;
 }
 
+/** Quita notas técnicas del JSON (ej. `incluyeRefresco`) para WhatsApp. */
+function sanitizarTextoPromoCliente(raw) {
+  let t = String(raw || "").trim();
+  if (!t) return "";
+  if (/incluyeRefresco|indica si incluye/i.test(t) && t.length < 120) {
+    return "";
+  }
+  t = t.replace(/`[^`]*`/g, "").replace(/\s+/g, " ").trim();
+  return t;
+}
+
+function textoPromoCortoParaCliente(p) {
+  const fmt = sanitizarTextoPromoCliente(formatearTextoPromoCliente(p));
+  if (fmt) return fmt.slice(0, 120);
+  if (p?.incluyeRefresco === true) return "Incluye refresco 🥤";
+  const tc = sanitizarTextoPromoCliente(p?.textoCliente);
+  return tc ? tc.slice(0, 120) : "";
+}
+
 function formatearTextoPromoCliente(p) {
   if (!p) return "";
   const partes = [];
@@ -3652,7 +3842,7 @@ function formatearTextoPromoCliente(p) {
     return txt;
   }
   // Si también hay textoCliente, lo agrega al final como detalle extra.
-  const txt = String(p.textoCliente || "").trim();
+  const txt = sanitizarTextoPromoCliente(p.textoCliente);
   if (txt) partes.push(txt);
   return partes.join("\n");
 }
@@ -3789,9 +3979,9 @@ function puedeResponderConsultaDescripcion(paso) {
   return !PASOS_SIN_CONSULTA_DESCRIPCION.has(paso);
 }
 
-/** Respuesta local desde descripcionesMap si hay una sola pizza detectada. */
+/** Respuesta local desde descripcionesMap si hay una sola pizza detectada (sin fuzzy). */
 function textoDescripcionLocalPizza(textoClean) {
-  const ings = detectarIngredientes(textoClean);
+  const ings = detectarIngredientes(textoClean, { permitirFuzzy: false });
   if (ings.length !== 1) return null;
   const d = descripcionesMap[ings[0]];
   if (!d || (!d.ingredientesTexto && !d.descripcion)) return null;
@@ -3799,6 +3989,7 @@ function textoDescripcionLocalPizza(textoClean) {
   let msg = `🍕 *${tit}*`;
   if (d.ingredientesTexto) msg += `\n📋 ${d.ingredientesTexto}`;
   if (d.descripcion) msg += `\n_${d.descripcion}_`;
+  msg += `\n\n¿Te referías a la *${tit}*? Si quieres pedirla, dime *tamaño* o *quiero ${ings[0]}* 🍕`;
   return msg;
 }
 
@@ -3914,6 +4105,22 @@ function recalcularExtrasTotal(estado) {
   estado.extrasLineas = lineas;
 }
 
+function initCarritoEdiciones() {
+  carritoEdiciones.init({
+    sinAcentos,
+    normalizarTextoPedido,
+    detectarTamano,
+    detectarIngredientes,
+    getMenu: () => menu,
+    getComplementosItems: () => complementosItems,
+    resolverItemCatalogoPorNumeroONombre,
+    recalcularExtrasTotal,
+    subtotalesPedidoActuales,
+    esAfirmacionSimple,
+    botLogger
+  });
+}
+
 function mergeExtrasEnEstado(estado, textoClean) {
   const t = sinAcentos(normalizarTextoPedido(textoClean));
   estado.extrasActivos = estado.extrasActivos || {};
@@ -3925,9 +4132,22 @@ function mergeExtrasEnEstado(estado, textoClean) {
   recalcularExtrasTotal(estado);
 }
 
-function resolverConsultaPrecio(textoClean) {
+function resolverConsultaPrecio(textoClean, estado = null) {
   const t = sinAcentos(normalizarTextoPedido(textoClean));
   if (!esConsultaPrecio(textoClean)) return null;
+
+  if (estado?.esperandoSaborParaPrecio) {
+    const ings = detectarIngredientes(textoClean, { permitirFuzzy: true });
+    if (ings.length === 1 && menu[ings[0]]) {
+      const tam = estado.esperandoSaborParaPrecio;
+      estado.esperandoSaborParaPrecio = null;
+      const pr = menu[ings[0]][tam];
+      if (pr != null) {
+        estado.precioConsultaReciente = { sabor: ings[0], tamano: tam, precio: pr };
+        return `💲 *${capitalizar(ings[0])}* ${tam}: *$${pr}*\n\n¿La pides? *quiero ${ings[0]} ${tam}* o *me la mandan* 🍕`;
+      }
+    }
+  }
 
   for (const c of complementosItems) {
     const cn = sinAcentos(normalizarTextoPedido(c.nombre));
@@ -3944,7 +4164,7 @@ function resolverConsultaPrecio(textoClean) {
   }
 
   const tam = detectarTamano(textoClean);
-  const ings = detectarIngredientes(textoClean);
+  const ings = detectarIngredientes(textoClean, { permitirFuzzy: true });
   const extrasInfo = detectarExtrasEnTexto(textoClean, tam);
   const mitadFrase =
     /(mitad\s*y\s*mitad|media\s*y\s*media|dos\s*sabores|combinad(a|o))/.test(
@@ -3972,8 +4192,7 @@ function resolverConsultaPrecio(textoClean) {
   }
 
   if (tam && ings.length === 0) {
-    // Si el cliente solo pide "precio de la grande" sin sabor,
-    // pedimos el ingrediente para responder exacto.
+    if (estado) estado.esperandoSaborParaPrecio = tam;
     return `💲 Sí: ¿de qué *sabor* quieres la *${tam}*? (ej. *hawaiana*, *peperoni*)`;
   }
 
@@ -3991,10 +4210,15 @@ function resolverConsultaPrecio(textoClean) {
   if (ings.length === 1 && tam) {
     const pr = menu[ings[0]]?.[tam];
     if (pr == null) return null;
+    if (estado) {
+      estado.precioConsultaReciente = { sabor: ings[0], tamano: tam, precio: pr };
+      estado.esperandoSaborParaPrecio = null;
+    }
     let msg = `💲 *${capitalizar(ings[0])}* ${tam}: *$${pr}*`;
     if (extrasInfo.total) {
       msg += `\nExtras: ${extrasInfo.lineas.join(", ")} → total aprox *$${pr + extrasInfo.total}*`;
     }
+    msg += `\n\n¿La pides? *quiero ${ings[0]} ${tam}* o *me la mandan* 🍕`;
     return msg;
   }
 
@@ -4225,6 +4449,8 @@ async function startBot() {
   bebidasMenu = beb.menu;
   descripcionesMap = await cargarDescripciones();
   rebuildDetectCache();
+  botLogger.init({ registrarEventoMetricas });
+  initCarritoEdiciones();
   initFuzzyCarly();
   initPagoCarly();
   initConsultasCarly();

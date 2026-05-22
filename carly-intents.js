@@ -238,7 +238,7 @@ function planificarRespuesta(analisis, estado, textoClean) {
       const r = deps.responderConsultaRebanadas?.(textoClean);
       if (r) bloques.push(r);
     }
-    if (key === "ingredientes") {
+    if (key === "ingredientes" && deps.esPreguntaIngredientesPizza?.(textoClean)) {
       const r = deps.textoDescripcionLocalPizza?.(textoClean);
       if (r) bloques.push(r);
     }

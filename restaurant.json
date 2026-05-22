@@ -188,7 +188,7 @@
       "id": "miercoles_refresco",
       "titulo": "🥤 Miércoles",
       "diasSemana": [3],
-      "textoCliente": "🥤 Promo de miércoles; indica si incluye refresco en `incluyeRefresco`.",
+      "textoCliente": "🥤 En pizzas *grande o mayores* suele aplicar *refresco GRATIS* (conserva este chat por si hace falta en entrega).",
       "imagenUrl": "https://drive.google.com/file/d/1IeTj0XA-gaUnVveDnuVXxdqlXczkN0d2/view?usp=drive_link",
       "vigencia": {},
       "incluyeRefresco": true,
