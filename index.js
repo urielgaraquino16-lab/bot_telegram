@@ -65,6 +65,7 @@ const MENSAJE_FUERA_HORARIO =
 const MENSAJE_REACTIVACION_BOT =
   "😊 Hola de nuevo, soy Carly.\n¿Te puedo ayudar con algo? 🍕";
 const PROCESANDO_MAX_MS = 45000;
+const MAX_PENDING_MESSAGES = 5;
 const MENSAJE_PASO_A_HUMANO =
   "🙌 ¡Perfecto! Ya te paso con alguien del equipo para cerrar tu pedido.\nEn un momentito te escriben 👋🍕";
 const MENSAJE_BOT_PAUSADO_CHAT =
@@ -978,6 +979,23 @@ function parseEleccionSalsa(textoClean) {
   };
 }
 
+function etiquetaSalsaComplemento(L) {
+  return L.salsaEtiqueta || L.salsa || null;
+}
+
+/** Sincroniza mapa complementos + lineasComplemento (totales y resumen). */
+function agregarLineaComplemento(estado, nombre, cantidad, opts = {}) {
+  const cant = Number(cantidad) || 1;
+  if (!estado.complementos) estado.complementos = {};
+  estado.complementos[nombre] = (estado.complementos[nombre] || 0) + cant;
+  if (!Array.isArray(estado.lineasComplemento)) estado.lineasComplemento = [];
+  const line = { nombre, cantidad: cant };
+  const sal = opts.salsaEtiqueta || opts.salsa;
+  if (sal) line.salsaEtiqueta = sal;
+  if (opts.extraMitadSalsa) line.extraMitadSalsa = Number(opts.extraMitadSalsa) || 0;
+  estado.lineasComplemento.push(line);
+}
+
 function totalYResumenComplementos(estado) {
   if (
     Array.isArray(estado.lineasComplemento) &&
@@ -989,7 +1007,11 @@ function totalYResumenComplementos(estado) {
       const sub = L.cantidad * base + Number(L.extraMitadSalsa || 0);
       total += sub;
       const mx = L.extraMitadSalsa ? ` (+$${L.extraMitadSalsa} mix)` : "";
-      return `${L.nombre} x${L.cantidad} (${L.salsaEtiqueta})${mx}`;
+      const salsa = etiquetaSalsaComplemento(L);
+      const salsaPart = complementoRequiereSalsa(L.nombre)
+        ? ` (${salsa || "sin salsa"})`
+        : "";
+      return `${L.nombre} x${L.cantidad}${salsaPart}${mx}`;
     });
     return { total, resumen: partes.join(", ") };
   }
@@ -1906,7 +1928,10 @@ function initFuzzyCarly() {
     appendFile: (path, data) => fsp.appendFile(path, data, "utf8"),
     guardarRestauranteAliases,
     notificarTelegram: enviarTelegram,
-    registrarAprendizaje: (entry) => registrarAprendizajeAsync(entry)
+    registrarAprendizaje: (entry) => registrarAprendizajeAsync(entry),
+    agregarLineaComplemento,
+    complementoRequiereSalsa,
+    parseEleccionSalsa
   });
 }
 
@@ -2249,23 +2274,23 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       return;
     }
     const pick = resolverItemCatalogoPorNumeroONombre(textoClean);
-    if (pick) {
-      if (!estado.complementos) estado.complementos = {};
-      estado.complementos[pick.nombre] = (estado.complementos[pick.nombre] || 0) + 1;
-      if (pick.tipo === "bebida") {
-        if (!Array.isArray(estado.lineasBebida)) estado.lineasBebida = [];
-        estado.lineasBebida.push({ nombre: pick.nombre, cantidad: 1 });
-      } else if (!Array.isArray(estado.lineasComplemento)) {
-        estado.lineasComplemento = [];
-      }
-      if (pick.tipo === "comp") {
-        estado.lineasComplemento.push({ nombre: pick.nombre, cantidad: 1 });
-      }
+    if (pick?.tipo === "comp") {
+      agregarLineaComplemento(estado, pick.nombre, 1);
+    } else if (pick?.tipo === "bebida") {
+      if (!Array.isArray(estado.lineasBebida)) estado.lineasBebida = [];
+      estado.lineasBebida.push({ nombre: pick.nombre, cantidad: 1 });
     }
     const directo = detectarPedidoDirecto(textoClean);
     if (directo?.complementos) {
+      const salsaPick = parseEleccionSalsa(textoClean);
+      const salsaLabel =
+        salsaPick?.resultado === "ok" ? salsaPick.label : null;
       for (const [nombre, cant] of Object.entries(directo.complementos)) {
-        estado.complementos[nombre] = (estado.complementos[nombre] || 0) + (cant || 1);
+        const opts = {};
+        if (complementoRequiereSalsa(nombre) && salsaLabel) {
+          opts.salsaEtiqueta = salsaLabel;
+        }
+        agregarLineaComplemento(estado, nombre, cant, opts);
       }
     }
     return;
@@ -2669,15 +2694,19 @@ async function confirmarPedidoYPasarAHumano(sock, from, estado, quien) {
 
   const payload = `🍕 *PEDIDO — PASAR A COLABORADOR*\n\n📞 ${quien}\nJID: ${from}\n📍 ${dir}\n\n${resumen || "—"}\n💰 Total: $${total}${bloquePago}`;
 
+  const telefono = String(from || "").replace(/@.+$/, "");
   try {
-    const telefono = String(from || "").replace(/@.+$/, "");
     await guardarPedido({
       cliente: quien || "Cliente",
       telefono,
       pedido: `${resumen || lineaPizzaEmoji(estado) || "Pedido"} | ${dir}`,
       total: Number(total || 0)
     });
-    const pedidoGuardar = `
+  } catch (err) {
+    console.error("❌ confirmarPedido Firestore:", err?.message || err);
+  }
+
+  const pedidoGuardar = `
 ------------------------
 Cliente: ${from}
 Pedido: ${resumen}
@@ -2686,10 +2715,11 @@ Total: $${total}
 Pago: ${lineaPago || "—"}
 Fecha: ${new Date().toLocaleString()}
 `;
+  try {
     await registrarPedidoEnStorage(pedidoGuardar);
     ultimoPedidoPorCliente[from] = snapshotPedido(estado);
   } catch (err) {
-    console.error("❌ confirmarPedidoYPasarAHumano:", err?.message || err);
+    console.error("❌ confirmarPedido pedidos.txt:", err?.message || err);
   }
 
   await sendText(sock, from, estado, MENSAJE_PASO_A_HUMANO);
@@ -3759,12 +3789,11 @@ function aplicarComplementosYBebidasDesdeTexto(estado, textoClean) {
   let any = false;
 
   for (const [nombre, cant] of Object.entries(complementos)) {
-    if (!estado.complementos) estado.complementos = {};
-    estado.complementos[nombre] = (estado.complementos[nombre] || 0) + (cant || 1);
-    if (!Array.isArray(estado.lineasComplemento)) estado.lineasComplemento = [];
-    const line = { nombre, cantidad: cant || 1 };
-    if (complementoRequiereSalsa(nombre) && salsaLabel) line.salsa = salsaLabel;
-    estado.lineasComplemento.push(line);
+    const opts = {};
+    if (complementoRequiereSalsa(nombre) && salsaLabel) {
+      opts.salsaEtiqueta = salsaLabel;
+    }
+    agregarLineaComplemento(estado, nombre, cant, opts);
     any = true;
   }
 
@@ -4841,7 +4870,18 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
   if (!st) return;
 
   const ejecutarProcesamiento = async (t, tc, esNuevo) => {
-    if (st.procesando) return;
+    if (st.procesando) {
+      if (!Array.isArray(st._pendingMessages)) st._pendingMessages = [];
+      if (st._pendingMessages.length < MAX_PENDING_MESSAGES) {
+        st._pendingMessages.push({
+          texto: t,
+          textoClean: tc,
+          esNuevo: !!esNuevo,
+          at: Date.now()
+        });
+      }
+      return;
+    }
     st.procesando = true;
     const liberarProcesando = () => {
       if (estados[from]) estados[from].procesando = false;
@@ -4853,6 +4893,14 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
     } finally {
       clearTimeout(watchdog);
       liberarProcesando();
+      const pend = st._pendingMessages?.shift();
+      if (pend) {
+        setImmediate(() => {
+          ejecutarProcesamiento(pend.texto, pend.textoClean, pend.esNuevo).catch((err) =>
+            console.error("❌ cola mensaje:", err?.message || err)
+          );
+        });
+      }
     }
   };
 

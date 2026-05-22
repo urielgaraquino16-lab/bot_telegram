@@ -29,7 +29,8 @@ function mensajeConfirmacionMulti(estado, deps) {
 
   for (const L of estado.lineasComplemento || []) {
     let n = cap(L.nombre);
-    if (L.salsa) n += ` ${L.salsa}`;
+    const sal = L.salsaEtiqueta || L.salsa;
+    if (sal) n += ` ${sal}`;
     else if (
       deps.complementoRequiereSalsa?.(L.nombre) &&
       estado.ctxMemoria?.ultimaSalsa

@@ -388,12 +388,23 @@ function aplicarPropuesta(estado, propuesta) {
     return;
   }
   if (propuesta.tipo === "comp") {
-    if (!estado.complementos) estado.complementos = {};
     const n = propuesta.nombre;
     const q = propuesta.cantidad || 1;
-    estado.complementos[n] = (estado.complementos[n] || 0) + q;
-    if (!Array.isArray(estado.lineasComplemento)) estado.lineasComplemento = [];
-    estado.lineasComplemento.push({ nombre: n, cantidad: q });
+    const opts = {};
+    const sp = deps.parseEleccionSalsa?.(propuesta.textoOriginal || "");
+    if (sp?.resultado === "ok" && deps.complementoRequiereSalsa?.(n)) {
+      opts.salsaEtiqueta = sp.label;
+    }
+    if (deps.agregarLineaComplemento) {
+      deps.agregarLineaComplemento(estado, n, q, opts);
+    } else {
+      if (!estado.complementos) estado.complementos = {};
+      estado.complementos[n] = (estado.complementos[n] || 0) + q;
+      if (!Array.isArray(estado.lineasComplemento)) estado.lineasComplemento = [];
+      const line = { nombre: n, cantidad: q };
+      if (opts.salsaEtiqueta) line.salsaEtiqueta = opts.salsaEtiqueta;
+      estado.lineasComplemento.push(line);
+    }
     if (!estado.pasoPedido) estado.pasoPedido = "D";
     return;
   }
