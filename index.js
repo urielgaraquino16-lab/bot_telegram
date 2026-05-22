@@ -66,6 +66,9 @@ const MENSAJE_REACTIVACION_BOT =
   "😊 Hola de nuevo, soy Carly.\n¿Te puedo ayudar con algo? 🍕";
 const PROCESANDO_MAX_MS = 45000;
 const MAX_PENDING_MESSAGES = 5;
+const GUARDAR_PEDIDO_TIMEOUT_MS = 5000;
+const GOOGLE_SHEETS_TIMEOUT_MS = 8000;
+const ARCHIVO_ROTACION_MAX_BYTES = 8 * 1024 * 1024;
 const MENSAJE_PASO_A_HUMANO =
   "🙌 ¡Perfecto! Ya te paso con alguien del equipo para cerrar tu pedido.\nEn un momentito te escriben 👋🍕";
 const MENSAJE_BOT_PAUSADO_CHAT =
@@ -237,10 +240,25 @@ async function obtenerFilasDeHojaGoogleSheetsGviz(sheetName) {
     return cached.rows;
   }
   const url = urlGoogleSheetGviz(sheetName);
-  const response = await axios.get(url, { responseType: "text" });
-  const rows = parsearRespuestaGvizJson(response.data);
-  sheetsCache.set(cacheKey, { at: Date.now(), rows });
-  return rows;
+  try {
+    const response = await axios.get(url, {
+      responseType: "text",
+      timeout: GOOGLE_SHEETS_TIMEOUT_MS
+    });
+    const rows = parsearRespuestaGvizJson(response.data);
+    sheetsCache.set(cacheKey, { at: Date.now(), rows });
+    return rows;
+  } catch (err) {
+    console.error(
+      `❌ Google Sheets (${sheetName}):`,
+      err?.code === "ECONNABORTED" ? "timeout" : err?.message || err
+    );
+    if (cached?.rows?.length) {
+      console.warn(`⚠️ Google Sheets: usando caché anterior (${sheetName})`);
+      return cached.rows;
+    }
+    throw err;
+  }
 }
 
 function normalizarFilaGoogleSheet(row) {
@@ -262,9 +280,10 @@ async function obtenerDatosMenuGoogleSheets() {
 }
 
 async function cargarMenu() {
+  const menuAnterior = menu;
   try {
     const data = await obtenerDatosMenuGoogleSheets();
-    const menu = {};
+    const menuNuevo = {};
 
     data.forEach((row) => {
       const r = normalizarFilaGoogleSheet(row);
@@ -276,17 +295,21 @@ async function cargarMenu() {
       const precio = parsearPrecioSheet(r.precio);
       if (!pizza || !tamaño || Number.isNaN(precio)) return;
 
-      if (!menu[pizza]) {
-        menu[pizza] = {};
+      if (!menuNuevo[pizza]) {
+        menuNuevo[pizza] = {};
       }
 
-      menu[pizza][tamaño] = precio;
+      menuNuevo[pizza][tamaño] = precio;
     });
 
-    return menu;
+    if (Object.keys(menuNuevo).length === 0 && Object.keys(menuAnterior).length > 0) {
+      console.warn("⚠️ cargarMenu: hoja vacía; se mantiene menú anterior");
+      return menuAnterior;
+    }
+    return menuNuevo;
   } catch (err) {
     console.warn("⚠️ cargarMenu error:", err?.message || err);
-    return {};
+    return Object.keys(menuAnterior).length > 0 ? menuAnterior : {};
   }
 }
 
@@ -1807,7 +1830,11 @@ async function consultaPanelDel(typo) {
 
 function registrarAprendizajeIntentsAsync(entry) {
   const row = { ts: new Date().toISOString(), ...entry };
-  return fsp.appendFile("aprendizaje_intents.jsonl", JSON.stringify(row) + "\n", "utf8").catch(() => {});
+  return rotarArchivoSiGrande("aprendizaje_intents.jsonl")
+    .then(() =>
+      fsp.appendFile("aprendizaje_intents.jsonl", JSON.stringify(row) + "\n", "utf8")
+    )
+    .catch(() => {});
 }
 
 function initCarlyIntents() {
@@ -2701,13 +2728,15 @@ async function confirmarPedidoYPasarAHumano(sock, from, estado, quien) {
   const payload = `🍕 *PEDIDO — PASAR A COLABORADOR*\n\n📞 ${quien}\nJID: ${from}\n📍 ${dir}\n\n${resumen || "—"}\n💰 Total: $${total}${bloquePago}`;
 
   const telefono = String(from || "").replace(/@.+$/, "");
+  let firestorePedidoOk = false;
   try {
-    await guardarPedido({
+    const idFirestore = await guardarPedido({
       cliente: quien || "Cliente",
       telefono,
       pedido: `${resumen || lineaPizzaEmoji(estado) || "Pedido"} | ${dir}`,
       total: Number(total || 0)
     });
+    firestorePedidoOk = !!idFirestore;
   } catch (err) {
     console.error("❌ confirmarPedido Firestore:", err?.message || err);
   }
@@ -2721,11 +2750,23 @@ Total: $${total}
 Pago: ${lineaPago || "—"}
 Fecha: ${new Date().toLocaleString()}
 `;
+  let pedidoLocalOk = false;
   try {
     await registrarPedidoEnStorage(pedidoGuardar);
     ultimoPedidoPorCliente[from] = snapshotPedido(estado);
+    pedidoLocalOk = true;
   } catch (err) {
     console.error("❌ confirmarPedido pedidos.txt:", err?.message || err);
+  }
+
+  if (!firestorePedidoOk) {
+    await alertarPedidoSoloLocal(sock, {
+      from,
+      quien,
+      telefono,
+      resumen: resumen || lineaPizzaEmoji(estado) || "Pedido",
+      motivo: pedidoLocalOk ? "firestore_fail_local_ok" : "firestore_fail"
+    });
   }
 
   estado._pedidoConfirmadoAt = Date.now();
@@ -3320,8 +3361,56 @@ async function notificarUrgenteMovil(sock, { waTitulo, waDetalle, tgTexto }) {
   }
 }
 
+function nombreArchivoRotado(filePath) {
+  const d = new Date();
+  const suf = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const dot = filePath.lastIndexOf(".");
+  if (dot < 0) return `${filePath}-${suf}`;
+  return `${filePath.slice(0, dot)}-${suf}${filePath.slice(dot)}`;
+}
+
+async function rotarArchivoSiGrande(filePath) {
+  try {
+    const st = await fsp.stat(filePath);
+    if (st.size < ARCHIVO_ROTACION_MAX_BYTES) return;
+    const dest = nombreArchivoRotado(filePath);
+    await fsp.rename(filePath, dest);
+    console.log(`📁 Rotado ${filePath} → ${dest} (${st.size} bytes)`);
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      console.warn(`⚠️ rotarArchivoSiGrande(${filePath}):`, err?.message || err);
+    }
+  }
+}
+
+async function alertarPedidoSoloLocal(sock, { from, quien, telefono, resumen, motivo }) {
+  const meta = {
+    from,
+    telefono: telefono || String(from || "").replace(/@.+$/, ""),
+    quien: quien || "Cliente",
+    motivo: motivo || "firestore_fail",
+    resumen: String(resumen || "").slice(0, 240)
+  };
+  console.error("🚨 [Carly] pedido_solo_local — revisar Firestore / pedidos.txt", meta);
+  try {
+    await registrarEventoMetricas("pedido_solo_local", meta);
+  } catch (_) {}
+  if (!sock) return;
+  const detalle = `⚠️ *pedido_solo_local*\n📞 ${meta.quien}\nJID: ${from}\n${meta.resumen ? `📋 ${meta.resumen}\n` : ""}Motivo: ${meta.motivo}`;
+  try {
+    await notificarUrgenteMovil(sock, {
+      waTitulo: "PEDIDO SOLO LOCAL",
+      waDetalle: detalle,
+      tgTexto: detalle
+    });
+  } catch (err) {
+    console.error("❌ alertarPedidoSoloLocal notify:", err?.message || err);
+  }
+}
+
 // Punto único de persistencia: facilita migrar a Firestore después.
 async function registrarPedidoEnStorage(textoRegistro) {
+  await rotarArchivoSiGrande("pedidos.txt");
   await fsp.appendFile("pedidos.txt", textoRegistro, "utf8");
 }
 
@@ -3332,6 +3421,7 @@ async function registrarEventoMetricas(evento, payload = {}) {
       evento,
       ...payload
     };
+    await rotarArchivoSiGrande("metricas.jsonl");
     await fsp.appendFile("metricas.jsonl", JSON.stringify(row) + "\n", "utf8");
 
     // Métricas en Firestore: opt-in vía METRICAS_FIRESTORE=1.
@@ -3395,11 +3485,30 @@ async function guardarPedido(pedido) {
       fecha: new Date()
     };
 
-    const ref = await firestore.collection("pedidos").add(doc);
+    const operacion = firestore.collection("pedidos").add(doc);
+    let timeoutHandle;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(
+        () => reject(new Error("GUARDAR_PEDIDO_TIMEOUT")),
+        GUARDAR_PEDIDO_TIMEOUT_MS
+      );
+    });
+    let ref;
+    try {
+      ref = await Promise.race([operacion, timeoutPromise]);
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
     console.log(`✅ Pedido guardado en Firestore (id=${ref.id}) para ${cliente}.`);
     return ref.id;
   } catch (err) {
-    console.error("❌ guardarPedido: error guardando en Firestore:", err?.message || err);
+    if (err?.message === "GUARDAR_PEDIDO_TIMEOUT") {
+      console.error(
+        `❌ guardarPedido: timeout (>${GUARDAR_PEDIDO_TIMEOUT_MS}ms) — continúa flujo local`
+      );
+    } else {
+      console.error("❌ guardarPedido: error guardando en Firestore:", err?.message || err);
+    }
     return null;
   }
 }
@@ -4644,20 +4753,23 @@ async function derivarPedidoAHumano(sock, from, estado, quien, detalle = "") {
   });
 
   // Persistimos el pedido en Firestore (sin dirección; lo confirma el asesor).
+  let firestoreDerivadoOk = false;
+  const telefonoDerivado = String(from || "").replace(/@.+$/, "");
   try {
     const { precioPizza, cb, ext, total } = subtotalesPedidoActuales(estado);
-    const telefono = String(from || "").replace(/@.+$/, "");
-    await guardarPedido({
+    const idFirestore = await guardarPedido({
       cliente: quien || "Cliente",
-      telefono,
+      telefono: telefonoDerivado,
       pedido: resumen || lineaPizzaEmoji(estado) || "Pedido",
       total: Number(total || precioPizza || 0)
     });
+    firestoreDerivadoOk = !!idFirestore;
   } catch (err) {
     console.error("❌ Error guardando pedido derivado en Firestore:", err?.message || err);
   }
 
   // Persistencia local (mantener tu comportamiento actual).
+  let pedidoDerivadoLocalOk = false;
   try {
     const { precioPizza, cb, ext, total } = subtotalesPedidoActuales(estado);
     const pedidoGuardar = `
@@ -4673,8 +4785,19 @@ Fecha: ${new Date().toLocaleString()}
 `;
     await registrarPedidoEnStorage(pedidoGuardar);
     ultimoPedidoPorCliente[from] = snapshotPedido(estado);
+    pedidoDerivadoLocalOk = true;
   } catch (err) {
     console.error("❌ Error guardando pedido derivado local:", err?.message || err);
+  }
+
+  if (!firestoreDerivadoOk) {
+    await alertarPedidoSoloLocal(sock, {
+      from,
+      quien,
+      telefono: telefonoDerivado,
+      resumen: resumen || lineaPizzaEmoji(estado) || "Pedido",
+      motivo: pedidoDerivadoLocalOk ? "firestore_fail_local_ok" : "firestore_fail"
+    });
   }
 
   // Pausa el bot esperando confirmación del humano.
@@ -5022,6 +5145,18 @@ async function procesarMensajeUpsert(sock, msg) {
             esNuevo: !!esNuevo,
             at: Date.now()
           });
+        } else {
+          console.warn("[Carly] cola_descartada_limite", {
+            cliente: from,
+            cantidad: st._pendingMessages.length,
+            max: MAX_PENDING_MESSAGES,
+            ts: Date.now()
+          });
+          registrarEventoMetricas("cola_descartada_limite", {
+            from,
+            cantidad: st._pendingMessages.length,
+            max: MAX_PENDING_MESSAGES
+          }).catch(() => {});
         }
       }
       return;
