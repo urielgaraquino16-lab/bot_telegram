@@ -35,6 +35,7 @@ const carritoEdiciones = require("./carrito-ediciones");
 const mensajesCarly = require("./mensajes-carly");
 const contextoCarly = require("./contexto-carly");
 const objecionesCarly = require("./objeciones-carly");
+const humanosCarly = require("./humanos-carly");
 const RESPUESTA_LOCAL_YA_ENVIADA = "__RESPUESTA_LOCAL_YA_ENVIADA__";
 
 // Firestore (opcional). Si falta clave.json o falla la inicialización, el bot
@@ -485,6 +486,7 @@ async function recargarRestauranteSiCambioAsync() {
       restauranteMtimeMs = mtimeMs;
       restaurante = cargarRestaurante();
       aplicarBotConfigAMemoria(botConfigStore.getConfig());
+      if (typeof initHumanosCarly === "function") initHumanosCarly();
       if (typeof initCarritoEdiciones === "function") initCarritoEdiciones();
       if (typeof initContextoCarly === "function") initContextoCarly();
       initCarlyIntents();
@@ -2136,6 +2138,9 @@ async function intentarRespuestaLocalCarly(sock, from, estado, textoClean, texto
 }
 
 function intentarAclaracionAmbigua(textoClean, estado) {
+  const hum = humanosCarly.intentarAclaracionHumana(estado, textoClean);
+  if (hum) return hum;
+
   const x = sinAcentos(normalizarTextoPedido(textoClean));
   if (!x || ["G", "H", "I"].includes(estado.pasoPedido)) return null;
 
@@ -2146,7 +2151,7 @@ function intentarAclaracionAmbigua(textoClean, estado) {
   if (!estado.pasoPedido && !estado.confirmacionPendiente) {
     const ings = detectarIngredientes(x, { permitirFuzzy: false });
     if (ings.length >= 2 && !/(mitad|y\s+mitad|dos\s*sabor)/.test(x)) {
-      botLogger.cliente("ambiguedad_dos_sabores", { sabores: ings.join("|") });
+      botLogger.ambiguo("dos_sabores", { sabores: ings.join("|") });
       return `🍕 ¿Es *mitad y mitad* (${capitalizar(ings[0])} y ${capitalizar(ings[1])}) o solo una pizza?\nDime cuál 😊`;
     }
   }
@@ -2189,6 +2194,7 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
         }
         if (aplicarComplementosYBebidasDesdeTexto(estado, textoClean)) {
           estado._pendienteConfirmMulti = true;
+          humanosCarly.sincronizarProductosRecientesDesdeEstado(estado);
         }
       } else {
         const fuzzySug = fuzzyCarly.buscarSaboresPizzaSolo(textoClean)[0];
@@ -2209,18 +2215,22 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       "4": "jumbo",
       "5": "mega"
     };
-    const tam = mapa[textoClean] || detectarTamano(textoClean);
     let pizza = estado.ingredientes?.[0];
     if (
       !pizza &&
-      tam &&
       contextoCarly.memoriaVigente(estado) &&
       estado.ctxMemoria?.ultimoTema === "pizza"
     ) {
       const pCtx = estado.ctxMemoria.ultimoProducto;
-      if (pCtx && menu[pCtx]?.[tam]) pizza = pCtx;
+      if (pCtx && menu[pCtx]) pizza = pCtx;
     }
+    const tamAplicado =
+      mapa[textoClean] ||
+      humanosCarly.aplicarTamanoPizzaConCorreccion(estado, textoClean) ||
+      null;
+    const tam = tamAplicado || estado.tamano;
     if (tam && pizza && menu[pizza]?.[tam]) {
+      estado.ingredientes = [pizza];
       estado.tamano = tam;
       estado.pasoPedido = "C";
     }
@@ -2302,6 +2312,7 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
   if (pasoAnt !== pasoNuevo) {
     botLogger.estado("paso_pedido", { de: pasoAnt, a: pasoNuevo, servicio: estado.tipoServicio || null });
   }
+  humanosCarly.sincronizarProductosRecientesDesdeEstado(estado);
 }
 
 function marcarPasoConfirmacionPedido(estado) {
@@ -2383,6 +2394,16 @@ async function manejarComandoAdmin(sock, from, texto) {
 }
 
 async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, textoClean, esNuevoCliente) {
+  if (humanosCarly.esReclamoCliente(textoClean)) {
+    botLogger.reclamo("detectado", { preview: textoClean.slice(0, 50) });
+    await sendText(sock, from, estado, humanosCarly.mensajeReclamoCliente());
+    await activarModoHumano(sock, from, estado, quien, "reclamo_cliente", {
+      skipMensajeCliente: true
+    });
+    humanosCarly.marcarProcesadoBurst(estado, texto, textoClean);
+    return;
+  }
+
   if (estado.modoHumano) {
     if (Date.now() - Number(estado.tiempoEscalado || 0) >= MODO_HUMANO_TTL_MS) {
       estado.modoHumano = false;
@@ -4238,6 +4259,20 @@ function recalcularExtrasTotal(estado) {
   estado.extrasLineas = lineas;
 }
 
+function initHumanosCarly() {
+  humanosCarly.init({
+    sinAcentos,
+    normalizarTextoPedido,
+    detectarTamano,
+    detectarIngredientes,
+    obtenerComplementoPorEntrada,
+    getMenu: () => menu,
+    recalcularExtrasTotal,
+    capitalizar,
+    botLogger
+  });
+}
+
 function initContextoCarly() {
   contextoCarly.init({
     sinAcentos,
@@ -4258,7 +4293,10 @@ function initContextoCarly() {
     textoPromoCortoParaCliente,
     getRestaurante: () => restaurante,
     MENSAJE_FALLBACK_DEFAULT: MENSAJE_FALLBACK_SIN_GROQ_DEFAULT,
-    botLogger
+    botLogger,
+    hayContextoPizzaClaro: (e) => humanosCarly.hayContextoPizzaClaro(e),
+    hayContextoCruzado: (e) => humanosCarly.hayContextoCruzado(e),
+    intentarAclaracionHumana: (e, t) => humanosCarly.intentarAclaracionHumana(e, t)
   });
 }
 
@@ -4274,7 +4312,8 @@ function initCarritoEdiciones() {
     recalcularExtrasTotal,
     subtotalesPedidoActuales,
     esAfirmacionSimple,
-    botLogger
+    botLogger,
+    hayContextoPizzaClaro: (e) => humanosCarly.hayContextoPizzaClaro(e)
   });
 }
 
@@ -4614,6 +4653,7 @@ async function startBot() {
   descripcionesMap = await cargarDescripciones();
   rebuildDetectCache();
   botLogger.init({ registrarEventoMetricas });
+  initHumanosCarly();
   initCarritoEdiciones();
   initContextoCarly();
   initFuzzyCarly();
@@ -4799,29 +4839,33 @@ sock.ev.on("messages.upsert", async ({ messages }) => {
 
   const st = estados[from];
   if (!st) return;
-  if (st.procesando) return;
 
-  st.procesando = true;
-  const liberarProcesando = () => {
-    if (estados[from]) estados[from].procesando = false;
+  const ejecutarProcesamiento = async (t, tc, esNuevo) => {
+    if (st.procesando) return;
+    st.procesando = true;
+    const liberarProcesando = () => {
+      if (estados[from]) estados[from].procesando = false;
+    };
+    const watchdog = setTimeout(liberarProcesando, PROCESANDO_MAX_MS);
+    try {
+      await procesarConversacionCarly(sock, msg, from, quien, st, t, tc, esNuevo);
+      humanosCarly.marcarProcesadoBurst(st, t, tc);
+    } finally {
+      clearTimeout(watchdog);
+      liberarProcesando();
+    }
   };
-  const watchdog = setTimeout(liberarProcesando, PROCESANDO_MAX_MS);
 
-  try {
-    await procesarConversacionCarly(
-      sock,
-      msg,
-      from,
-      quien,
-      st,
-      texto,
-      textoClean,
-      esNuevoCliente
-    );
-  } finally {
-    clearTimeout(watchdog);
-    liberarProcesando();
+  if (humanosCarly.debeAgruparBurst(st, textoClean)) {
+    humanosCarly.encolarBurst(st, { texto, textoClean }, ({ texto: t, textoClean: tc }) => {
+      ejecutarProcesamiento(t, tc, false).catch((err) =>
+        console.error("❌ burst procesar:", err?.message || err)
+      );
+    });
+    return;
   }
+
+  await ejecutarProcesamiento(texto, textoClean, esNuevoCliente);
   return;
   } catch (err) {
     console.error("❌ Error en messages.upsert:", err?.message || err);

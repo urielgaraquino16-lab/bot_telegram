@@ -121,7 +121,12 @@ function actualizarContextoDesdeTexto(estado, textoClean) {
   }
 
   const tam = deps.detectarTamano?.(textoClean);
-  if (tam) touch(estado, { ultimoTamano: tam });
+  if (tam && deps.hayContextoPizzaClaro?.(estado) !== false) {
+    const soloPizza =
+      deps.hayContextoPizzaClaro?.(estado) ||
+      deps.detectarIngredientes?.(textoClean, { permitirFuzzy: false })?.length > 0;
+    if (soloPizza) touch(estado, { ultimoTamano: tam });
+  }
 
   const salsa = detectarSalsaEnTexto(textoClean);
   if (salsa) touch(estado, { ultimaSalsa: salsa, ultimoTema: estado.ctxMemoria?.ultimoTema || "alitas" });
@@ -170,6 +175,9 @@ function expandirTextoConContexto(estado, textoClean) {
 
   const tam = deps.detectarTamano?.(textoClean);
   if (tam && m.ultimoTema === "pizza" && m.ultimoProducto) {
+    if (deps.hayContextoCruzado?.(estado)) {
+      return { texto: textoClean, uso: false, ambiguo: "tamano_cruzado" };
+    }
     const menu = deps.getMenu?.() || {};
     if (menu[m.ultimoProducto] && !deps.detectarIngredientes(textoClean, { permitirFuzzy: false }).length) {
       return { texto: `${m.ultimoProducto} ${tam}`, uso: true, tipo: "tamano_ctx" };
@@ -183,7 +191,7 @@ function expandirTextoConContexto(estado, textoClean) {
 
   if (/^(la\s+)?(mediana|grande|familiar|jumbo|mega)\b/.test(x) && m.ultimoProducto) {
     const tam2 = deps.detectarTamano?.(textoClean);
-    if (tam2 && m.ultimoTema === "pizza") {
+    if (tam2 && m.ultimoTema === "pizza" && !deps.hayContextoCruzado?.(estado)) {
       return { texto: `${m.ultimoProducto} ${tam2}`, uso: true, tipo: "la_tamano_ctx" };
     }
   }
@@ -202,8 +210,16 @@ function precioComplementoPorNombre(nombre) {
 }
 
 function intentarRespuestaConContexto(estado, textoClean) {
+  const aclaracion = deps.intentarAclaracionHumana?.(estado, textoClean);
+  if (aclaracion) return aclaracion;
+
   actualizarContextoDesdeTexto(estado, textoClean);
   const exp = expandirTextoConContexto(estado, textoClean);
+
+  if (exp.ambiguo === "tamano_cruzado") {
+    const tam = deps.detectarTamano?.(textoClean);
+    return `🤔 ¿La *${tam || "grande"}* es para la *pizza*? 😊`;
+  }
 
   if (exp.uso && log.contexto_usado) {
     log.contexto_usado("expandir", {

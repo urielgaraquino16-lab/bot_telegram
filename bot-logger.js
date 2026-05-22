@@ -39,5 +39,10 @@ module.exports = {
   no_entendido: (evento, payload) => emitir("no_entendido", evento, payload),
   fuzzy: (evento, payload) => emitir("fuzzy", evento, payload),
   objecion: (evento, payload) => emitir("objecion", evento, payload),
-  confirm_multi: (evento, payload) => emitir("confirm_multi", evento, payload)
+  confirm_multi: (evento, payload) => emitir("confirm_multi", evento, payload),
+  ambiguo: (evento, payload) => emitir("ambiguo", evento, payload),
+  cambio_rapido: (evento, payload) => emitir("cambio_rapido", evento, payload),
+  contexto_cruzado: (evento, payload) => emitir("contexto_cruzado", evento, payload),
+  reclamo: (evento, payload) => emitir("reclamo", evento, payload),
+  multiples_mensajes: (evento, payload) => emitir("multiples_mensajes", evento, payload)
 };

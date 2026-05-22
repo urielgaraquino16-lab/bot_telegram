@@ -162,7 +162,8 @@ function cambiarTamanoEnCarrito(estado, x) {
   ) {
     return null;
   }
-  if (!estado.ingredientes?.length && !estado.tamano) return null;
+  if (!estado.ingredientes?.length) return null;
+  if (deps.hayContextoPizzaClaro && !deps.hayContextoPizzaClaro(estado)) return null;
   const antes = estado.tamano || "sin tamaño";
   estado.tamano = t;
   deps.recalcularExtrasTotal(estado);
