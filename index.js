@@ -921,16 +921,26 @@ function hayComplementosRequiriendoSalsaSinEtiqueta(estado) {
   return !!lineaComplementoSinSalsa(estado);
 }
 
-function aplicarSalsaALineasSinEtiqueta(estado, salsaLabel) {
+function aplicarSalsaALineasSinEtiqueta(estado, salsaLabel, extraMitadSalsa) {
   if (!salsaLabel) return false;
-  let n = 0;
-  for (const L of estado.lineasComplemento || []) {
-    if (complementoRequiereSalsa(L.nombre) && !etiquetaSalsaComplemento(L)) {
-      L.salsaEtiqueta = salsaLabel;
-      n++;
-    }
+  const L = lineaComplementoSinSalsa(estado);
+  if (!L) return false;
+  L.salsaEtiqueta = salsaLabel;
+  let extra = Number(extraMitadSalsa) || 0;
+  if (!extra && /^mitad /i.test(String(salsaLabel))) {
+    extra = Number(restaurante.alitasBonelessSalsas?.precioExtraMitadMitad) || 0;
   }
-  return n > 0;
+  if (extra) {
+    L.extraMitadSalsa = extra;
+    console.log("[Carly/extra_mitad]", JSON.stringify({ nombre: L.nombre, extra }));
+  }
+  const tag = /boneless/i.test(L.nombre) ? "boneless" : "alitas";
+  console.log(`[Carly/${tag}]`, JSON.stringify({ evento: "salsa_linea", nombre: L.nombre, salsa: salsaLabel }));
+  console.log("[Carly/salsa_linea]", JSON.stringify({ nombre: L.nombre, salsa: salsaLabel, extra: extra || 0 }));
+  if (/^mitad /i.test(String(salsaLabel))) {
+    console.log("[Carly/orden_dividida]", JSON.stringify({ nombre: L.nombre, salsa: salsaLabel, extra }));
+  }
+  return true;
 }
 
 async function solicitarSalsaSiFalta(sock, from, estado) {
@@ -951,11 +961,11 @@ function textoMenuSalsasAlitas() {
   const extra = Number(restaurante.alitasBonelessSalsas?.precioExtraMitadMitad) || 0;
   const head =
     extra > 0
-      ? `🍗 *Elige la salsa* (mitad y mitad de salsa: *+$${extra}* por orden de 1/2 kilo):\n\n`
+      ? `🍗 *Elige salsa por orden* (mitad y mitad en *una* orden: *+$${extra}*)\n\n`
       : `🍗 *Elige la salsa:*\n\n`;
   const body = lista.map((s, i) => `${i + 1}️⃣ ${s.nombre}`).join("\n");
   const foot =
-    "\n\n👉 Número o nombre. Mitad y mitad: ej. *mitad bbq y buffalo*";
+    "\n\n👉 Número o nombre. Mitad y mitad: ej. *mitad bbq y mango*";
   return head + body + foot;
 }
 
@@ -1031,6 +1041,7 @@ function parseEleccionSalsa(textoClean) {
 
   const pideMitad =
     /(mitad\s*y\s*mitad|dos\s*salsas|media\s*y\s*media)/.test(t) ||
+    /\bmitad\b[^,]{0,48}\s+y\s+/.test(t) ||
     (t.match(/\bmitad\b/g) || []).length >= 2;
 
   if (unicas.length >= 2) {
@@ -1092,11 +1103,38 @@ function agregarLineaComplemento(estado, nombre, cantidad, opts = {}) {
   if (!estado.complementos) estado.complementos = {};
   estado.complementos[nombre] = (estado.complementos[nombre] || 0) + cant;
   if (!Array.isArray(estado.lineasComplemento)) estado.lineasComplemento = [];
-  const line = { nombre, cantidad: cant };
+
   const sal = opts.salsaEtiqueta || opts.salsa;
-  if (sal) line.salsaEtiqueta = sal;
-  if (opts.extraMitadSalsa) line.extraMitadSalsa = Number(opts.extraMitadSalsa) || 0;
-  estado.lineasComplemento.push(line);
+  const extra = Number(opts.extraMitadSalsa) || 0;
+  const reqSalsa = complementoRequiereSalsa(nombre);
+  const tag = /boneless/i.test(nombre) ? "boneless" : reqSalsa ? "alitas" : null;
+
+  const pushLinea = (qty, lineOpts = {}) => {
+    const line = { nombre, cantidad: qty };
+    const s = lineOpts.salsaEtiqueta || lineOpts.salsa || sal;
+    if (s) line.salsaEtiqueta = s;
+    const ex = Number(lineOpts.extraMitadSalsa ?? extra) || 0;
+    if (ex) line.extraMitadSalsa = ex;
+    estado.lineasComplemento.push(line);
+    if (tag) {
+      console.log(`[Carly/${tag}]`, JSON.stringify({ evento: "linea_creada", nombre, cantidad: qty, salsa: s || null }));
+    }
+    if (ex) {
+      console.log("[Carly/extra_mitad]", JSON.stringify({ nombre, extra: ex, cantidad: qty }));
+      console.log("[Carly/orden_dividida]", JSON.stringify({ nombre, salsa: s || null, extra: ex }));
+    }
+    return line;
+  };
+
+  if (reqSalsa) {
+    for (let i = 0; i < cant; i++) {
+      pushLinea(1, opts);
+    }
+    console.log("[Carly/salsa_linea]", JSON.stringify({ nombre, ordenes: cant, salsa: sal || null, extra }));
+    return;
+  }
+
+  pushLinea(cant, opts);
 }
 
 function totalYResumenComplementos(estado) {
@@ -1105,18 +1143,38 @@ function totalYResumenComplementos(estado) {
     estado.lineasComplemento.length > 0
   ) {
     let total = 0;
+    let ordenSalsa = 0;
     const partes = estado.lineasComplemento.map((L) => {
       const base = Number(complementosMenu[L.nombre] || 0);
-      const sub = L.cantidad * base + Number(L.extraMitadSalsa || 0);
+      const qty = Number(L.cantidad) || 1;
+      const extraLinea = Number(L.extraMitadSalsa || 0);
+      const sub = qty * base + extraLinea;
       total += sub;
-      const mx = L.extraMitadSalsa ? ` (+$${L.extraMitadSalsa} mix)` : "";
+
+      if (complementoRequiereSalsa(L.nombre)) {
+        ordenSalsa += 1;
+        const salsa = etiquetaSalsaComplemento(L);
+        const capNom = capitalizar(L.nombre);
+        let bloque = `🍗 Orden ${ordenSalsa}: ${capNom}`;
+        if (salsa) {
+          const salsaTxt = /^mitad /i.test(salsa) ? salsa.replace(/^mitad /i, "mitad ") : salsa;
+          bloque += `\n${salsaTxt}`;
+        } else {
+          bloque += "\n(sin salsa)";
+        }
+        if (extraLinea) bloque += ` (+${extraLinea})`;
+        const tag = /boneless/i.test(L.nombre) ? "boneless" : "alitas";
+        console.log(`[Carly/${tag}]`, JSON.stringify({ evento: "resumen_orden", n: ordenSalsa, sub, extra: extraLinea }));
+        return bloque;
+      }
+
+      const mx = extraLinea ? ` (+$${extraLinea})` : "";
       const salsa = etiquetaSalsaComplemento(L);
-      const salsaPart = complementoRequiereSalsa(L.nombre)
-        ? ` (${salsa || "sin salsa"})`
-        : "";
-      return `${L.nombre} x${L.cantidad}${salsaPart}${mx}`;
+      const salsaPart = salsa ? ` (${salsa})` : "";
+      return `${L.nombre} x${qty}${salsaPart}${mx}`;
     });
-    return { total, resumen: partes.join(", ") };
+    console.log("[Carly/alitas]", JSON.stringify({ evento: "total_complementos", total, lineas: partes.length }));
+    return { total, resumen: partes.join(" | ") };
   }
   let total = 0;
   const partes = [];
@@ -2383,24 +2441,35 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       }
       return;
     }
+    const directo = detectarPedidoDirecto(textoClean);
+    const tieneCompDirecto =
+      directo?.complementos && Object.keys(directo.complementos).length > 0;
+    const tieneBebDirecto =
+      directo?.bebidas && Object.keys(directo.bebidas).length > 0;
     const pick = resolverItemCatalogoPorNumeroONombre(textoClean);
-    if (pick?.tipo === "comp") {
+    if (pick?.tipo === "comp" && !tieneCompDirecto) {
       agregarLineaComplemento(estado, pick.nombre, 1);
-    } else if (pick?.tipo === "bebida") {
+    } else if (pick?.tipo === "bebida" && !tieneBebDirecto) {
       if (!Array.isArray(estado.lineasBebida)) estado.lineasBebida = [];
       estado.lineasBebida.push({ nombre: pick.nombre, cantidad: 1 });
     }
-    const directo = detectarPedidoDirecto(textoClean);
     if (directo?.complementos) {
       const salsaPick = parseEleccionSalsa(textoClean);
-      const salsaLabel =
-        salsaPick?.resultado === "ok" ? salsaPick.label : null;
       for (const [nombre, cant] of Object.entries(directo.complementos)) {
         const opts = {};
-        if (complementoRequiereSalsa(nombre) && salsaLabel) {
-          opts.salsaEtiqueta = salsaLabel;
+        if (complementoRequiereSalsa(nombre) && salsaPick?.resultado === "ok") {
+          opts.salsaEtiqueta = salsaPick.label;
+          if (salsaPick.extraMitadSalsa) {
+            opts.extraMitadSalsa = salsaPick.extraMitadSalsa;
+          }
         }
         agregarLineaComplemento(estado, nombre, cant, opts);
+      }
+    }
+    if (directo?.bebidas) {
+      if (!Array.isArray(estado.lineasBebida)) estado.lineasBebida = [];
+      for (const [nombre, cant] of Object.entries(directo.bebidas)) {
+        estado.lineasBebida.push({ nombre, cantidad: cant || 1 });
       }
     }
     return;
@@ -2644,7 +2713,13 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   if (estado.pasoPedido === "D") {
     const salsaPick = parseEleccionSalsa(textoClean);
     if (salsaPick?.resultado === "ok") {
-      if (aplicarSalsaALineasSinEtiqueta(estado, salsaPick.label)) {
+      if (
+        aplicarSalsaALineasSinEtiqueta(
+          estado,
+          salsaPick.label,
+          salsaPick.extraMitadSalsa
+        )
+      ) {
         estado._pendienteSalsaNombre = null;
         estado._bloqueoSalsaPendiente = false;
         await sendText(sock, from, estado, `✅ Salsa *${salsaPick.label}* anotada.`);
@@ -4380,14 +4455,15 @@ function aplicarComplementosYBebidasDesdeTexto(estado, textoClean) {
   const { encontrados: complementos } = detectarComplementosEnTexto(textoClean);
   const bebidasDet = detectarBebidasEnTexto(textoClean);
   const salsaPick = parseEleccionSalsa(textoClean);
-  const salsaLabel =
-    salsaPick?.resultado === "ok" ? salsaPick.label : null;
   let any = false;
 
   for (const [nombre, cant] of Object.entries(complementos)) {
     const opts = {};
-    if (complementoRequiereSalsa(nombre) && salsaLabel) {
-      opts.salsaEtiqueta = salsaLabel;
+    if (complementoRequiereSalsa(nombre) && salsaPick?.resultado === "ok") {
+      opts.salsaEtiqueta = salsaPick.label;
+      if (salsaPick.extraMitadSalsa) {
+        opts.extraMitadSalsa = salsaPick.extraMitadSalsa;
+      }
     }
     agregarLineaComplemento(estado, nombre, cant, opts);
     any = true;
@@ -4938,7 +5014,8 @@ function initCarritoEdiciones() {
     subtotalesPedidoActuales,
     esAfirmacionSimple,
     botLogger,
-    hayContextoPizzaClaro: (e) => humanosCarly.hayContextoPizzaClaro(e)
+    hayContextoPizzaClaro: (e) => humanosCarly.hayContextoPizzaClaro(e),
+    complementoRequiereSalsa
   });
 }
 

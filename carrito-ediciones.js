@@ -136,6 +136,24 @@ function duplicarUltimoArticulo(estado) {
   }
   if (Array.isArray(estado.lineasComplemento) && estado.lineasComplemento.length > 0) {
     const last = estado.lineasComplemento[estado.lineasComplemento.length - 1];
+    if (deps.complementoRequiereSalsa?.(last.nombre)) {
+      const nueva = {
+        nombre: last.nombre,
+        cantidad: 1,
+        ...(last.salsaEtiqueta ? { salsaEtiqueta: last.salsaEtiqueta } : {}),
+        ...(last.extraMitadSalsa ? { extraMitadSalsa: last.extraMitadSalsa } : {})
+      };
+      estado.lineasComplemento.push(nueva);
+      if (estado.complementos && estado.complementos[last.nombre] != null) {
+        estado.complementos[last.nombre] = Number(estado.complementos[last.nombre] || 0) + 1;
+      }
+      console.log("[Carly/salsa_linea]", JSON.stringify({ evento: "duplicar_orden", nombre: last.nombre }));
+      logCarrito("duplicar_comp_orden", { nombre: last.nombre, salsa: last.salsaEtiqueta || null });
+      return mensajesCarly.mensajeEntendiCambio(
+        [`Otra orden de *${last.nombre}*`],
+        resumenTotalCorto(estado)
+      );
+    }
     last.cantidad = Number(last.cantidad || 0) + 1;
     if (estado.complementos && estado.complementos[last.nombre] != null) {
       estado.complementos[last.nombre] = Number(estado.complementos[last.nombre] || 0) + 1;

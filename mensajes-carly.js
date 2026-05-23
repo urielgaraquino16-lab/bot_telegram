@@ -37,7 +37,8 @@ function mensajeConfirmacionMulti(estado, deps) {
     ) {
       n += ` ${cap(estado.ctxMemoria.ultimaSalsa)}`;
     }
-    if (L.cantidad > 1) n += ` x${L.cantidad}`;
+    if (L.extraMitadSalsa) n += ` (+${L.extraMitadSalsa})`;
+    if (L.cantidad > 1 && !deps.complementoRequiereSalsa?.(L.nombre)) n += ` x${L.cantidad}`;
     lineas.push(n);
   }
 

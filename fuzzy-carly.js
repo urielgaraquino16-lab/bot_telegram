@@ -394,6 +394,7 @@ function aplicarPropuesta(estado, propuesta) {
     const sp = deps.parseEleccionSalsa?.(propuesta.textoOriginal || "");
     if (sp?.resultado === "ok" && deps.complementoRequiereSalsa?.(n)) {
       opts.salsaEtiqueta = sp.label;
+      if (sp.extraMitadSalsa) opts.extraMitadSalsa = sp.extraMitadSalsa;
     }
     if (deps.agregarLineaComplemento) {
       deps.agregarLineaComplemento(estado, n, q, opts);
@@ -401,9 +402,14 @@ function aplicarPropuesta(estado, propuesta) {
       if (!estado.complementos) estado.complementos = {};
       estado.complementos[n] = (estado.complementos[n] || 0) + q;
       if (!Array.isArray(estado.lineasComplemento)) estado.lineasComplemento = [];
-      const line = { nombre: n, cantidad: q };
-      if (opts.salsaEtiqueta) line.salsaEtiqueta = opts.salsaEtiqueta;
-      estado.lineasComplemento.push(line);
+      const reqSalsa = deps.complementoRequiereSalsa?.(n);
+      const lineas = reqSalsa ? q : 1;
+      for (let i = 0; i < lineas; i++) {
+        const line = { nombre: n, cantidad: reqSalsa ? 1 : q };
+        if (opts.salsaEtiqueta) line.salsaEtiqueta = opts.salsaEtiqueta;
+        if (opts.extraMitadSalsa) line.extraMitadSalsa = Number(opts.extraMitadSalsa) || 0;
+        estado.lineasComplemento.push(line);
+      }
     }
     if (!estado.pasoPedido) estado.pasoPedido = "D";
     return;
