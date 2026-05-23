@@ -1244,6 +1244,14 @@ function esAfirmacionSimple(textoClean) {
   return /^(si|sii+|claro|ok|oka+y?|va|dale|jalo|yes|1)$/.test(x);
 }
 
+function esConfirmacionHumana(textoClean) {
+  const x = sinAcentos(normalizarTextoPedido(textoClean));
+  return (
+    /^(correcto|correcta|exacto|exacta|ya quedo|asi esta|no cambiar|sin cambios)$/.test(x) ||
+    /^(si\s+)?mandamelas$/.test(x)
+  );
+}
+
 function esNegacionSimple(textoClean) {
   const x = sinAcentos(normalizarTextoPedido(textoClean));
   return /^(no|nop|nel|2|listo|ya no)$/.test(x);
@@ -2136,6 +2144,7 @@ function initFuzzyCarly() {
     detectarInicioPedido,
     mergeExtrasEnEstado,
     esAfirmacionSimple,
+    esConfirmacionHumana,
     esNegacionSimple,
     appendFile: (path, data) => fsp.appendFile(path, data, "utf8"),
     guardarRestauranteAliases,
@@ -2649,6 +2658,35 @@ async function manejarComandoAdmin(sock, from, texto) {
 }
 
 async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, textoClean, esNuevoCliente) {
+  if (textoClean.includes("cancelar")) {
+    const hayPedidoActivo =
+      !!estado.pasoPedido ||
+      !!estado.confirmacionPendiente ||
+      !!estado.pendienteEnvioConfirmacion ||
+      !!estado._bloqueoSalsaPendiente ||
+      hayContenidoCarrito(estado);
+    if (!hayPedidoActivo) {
+      await sendText(sock, from, estado, "😊 No tienes un pedido activo.");
+      return;
+    }
+    await registrarEventoMetricas("pedido_cancelado", { from, paso: estado.pasoPedido || "?" });
+    resetEstadoCliente(from, estado);
+    const estadoVivo = estados[from];
+    estadoVivo.pendienteEnvioConfirmacion = false;
+    estadoVivo._bloqueoSalsaPendiente = false;
+    estadoVivo.pasoPedido = null;
+    estadoVivo.confirmacionPendiente = null;
+    estadoVivo.modoHumano = false;
+    await borrarSnapshotCritico(from);
+    await sendText(
+      sock,
+      from,
+      estadoVivo,
+      "❌ Pedido cancelado.\n\n👋 Cuando quieras, escríbeme de nuevo 🍕"
+    );
+    return;
+  }
+
   if (humanosCarly.esReclamoCliente(textoClean)) {
     botLogger.reclamo("detectado", { preview: textoClean.slice(0, 50) });
     await sendText(sock, from, estado, humanosCarly.mensajeReclamoCliente());
@@ -2675,18 +2713,6 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   }
 
   await recargarArchivosSiCambioThrottled();
-
-  if (textoClean.includes("cancelar")) {
-    await registrarEventoMetricas("pedido_cancelado", { from, paso: estado.pasoPedido || "?" });
-    resetEstadoCliente(from, estado);
-    await sendText(
-      sock,
-      from,
-      estado,
-      "❌ Pedido cancelado.\n\n👋 Cuando quieras, escríbeme de nuevo 🍕"
-    );
-    return;
-  }
 
   if (esNuevoCliente && !estado.notificadoInicio && textoClean) {
     estado.notificadoInicio = true;
@@ -2843,7 +2869,7 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     return;
   }
 
-  if (estado.pasoPedido === "G" && esAfirmacionSimple(textoClean)) {
+  if (estado.pasoPedido === "G" && (esAfirmacionSimple(textoClean) || esConfirmacionHumana(textoClean))) {
     if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
       estado.pasoPedido = "D";
       await solicitarSalsaSiFalta(sock, from, estado);
@@ -3861,7 +3887,8 @@ async function leerSnapshotCritico(from) {
 }
 
 async function restaurarSnapshotCriticoEnEstado(from, estado) {
-  if (estado.pasoPedido && ["G", "H", "I"].includes(estado.pasoPedido)) return false;
+  if (estado.pasoPedido) return false;
+  if (hayContenidoCarrito(estado)) return false;
   const snap = await leerSnapshotCritico(from);
   if (!snap || !snap.expiresAt || snap.expiresAt < Date.now()) return false;
   if (!["G", "H", "I"].includes(snap.pasoPedido)) return false;

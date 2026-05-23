@@ -495,7 +495,7 @@ async function registrarAprendizaje(entry) {
 function manejarConfirmacionPendiente(estado, textoClean) {
   if (!estado?.confirmacionPendiente) return { manejado: false };
 
-  if (deps.esAfirmacionSimple(textoClean)) {
+  if (deps.esAfirmacionSimple(textoClean) || deps.esConfirmacionHumana?.(textoClean)) {
     const prop = estado.confirmacionPendiente.propuesta;
     aplicarPropuesta(estado, { ...prop, textoOriginal: estado.confirmacionPendiente.textoOriginal });
     deps.registrarAprendizaje?.({
