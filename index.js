@@ -2782,8 +2782,14 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
               seguimiento || `✅ Salsa *${salsaPick.label}* anotada.`
             );
           } else {
-            await sendText(sock, from, estado, `✅ Salsa *${salsaPick.label}* anotada.`);
             estado.pasoPedido = "E";
+            estado.pendienteEnvioConfirmacion = false;
+            await sendText(
+              sock,
+              from,
+              estado,
+              `✅ Salsa *${salsaPick.label}* anotada.\n\n🛵 ¿*Domicilio* o *recoger* en tienda?`
+            );
           }
           return;
         }
