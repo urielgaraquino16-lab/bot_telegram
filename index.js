@@ -2757,33 +2757,36 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
   }
 
   if (estado.pasoPedido === "D") {
-    const salsaPick = parseEleccionSalsa(textoClean);
-    if (salsaPick?.resultado === "error" && salsaPick.msg) {
-      await sendText(sock, from, estado, salsaPick.msg);
-      return;
-    }
-    if (salsaPick?.resultado === "ok") {
-      if (
-        aplicarSalsaALineasSinEtiqueta(
-          estado,
-          salsaPick.label,
-          salsaPick.extraMitadSalsa
-        )
-      ) {
-        estado._pendienteSalsaNombre = null;
-        estado._bloqueoSalsaPendiente = false;
-        if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
-          const seguimiento = textoConfirmacionSalsaConPendientes(estado);
-          await sendText(
-            sock,
-            from,
-            estado,
-            seguimiento || `✅ Salsa *${salsaPick.label}* anotada.`
-          );
-        } else {
-          await sendText(sock, from, estado, `✅ Salsa *${salsaPick.label}* anotada.`);
-        }
+    if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+      const salsaPick = parseEleccionSalsa(textoClean);
+      if (salsaPick?.resultado === "error" && salsaPick.msg) {
+        await sendText(sock, from, estado, salsaPick.msg);
         return;
+      }
+      if (salsaPick?.resultado === "ok") {
+        if (
+          aplicarSalsaALineasSinEtiqueta(
+            estado,
+            salsaPick.label,
+            salsaPick.extraMitadSalsa
+          )
+        ) {
+          estado._pendienteSalsaNombre = null;
+          estado._bloqueoSalsaPendiente = false;
+          if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+            const seguimiento = textoConfirmacionSalsaConPendientes(estado);
+            await sendText(
+              sock,
+              from,
+              estado,
+              seguimiento || `✅ Salsa *${salsaPick.label}* anotada.`
+            );
+          } else {
+            await sendText(sock, from, estado, `✅ Salsa *${salsaPick.label}* anotada.`);
+            estado.pasoPedido = "E";
+          }
+          return;
+        }
       }
     }
     if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
