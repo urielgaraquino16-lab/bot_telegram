@@ -1248,7 +1248,8 @@ function esConfirmacionHumana(textoClean) {
   const x = sinAcentos(normalizarTextoPedido(textoClean));
   return (
     /^(correcto|correcta|exacto|exacta|ya quedo|asi esta|no cambiar|sin cambios)$/.test(x) ||
-    /^(si\s+)?mandamelas$/.test(x)
+    /^(si\s+)?mandamelas$/.test(x) ||
+    /^(va|listo)$/.test(x)
   );
 }
 
@@ -2784,6 +2785,41 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
 
   if (estado.pasoPedido === "D") {
     if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
+      const edicion = aplicarEdicionCarritoNatural(estado, textoClean);
+      if (edicion) {
+        await sendText(sock, from, estado, edicion);
+        return;
+      }
+      const rFaq = buscarRespuestaFaq(textoClean);
+      if (rFaq) {
+        await sendText(sock, from, estado, rFaq);
+        return;
+      }
+      const rInfo = responderServicioHorarioPromoCombo(textoClean);
+      if (rInfo) {
+        await sendText(sock, from, estado, rInfo);
+        return;
+      }
+      if (/\b(ayuda|que hago|como sigo|que sigue)\b/.test(textoClean)) {
+        const seguimiento = textoPidaSalsaSeguimiento(estado);
+        await sendText(
+          sock,
+          from,
+          estado,
+          seguimiento ||
+            `🍗 Para continuar necesito la salsa pendiente.\n\n${textoMenuSalsasAlitas()}`
+        );
+        return;
+      }
+      if (/\b(mejor no|ya no quiero|otra cosa)\b/.test(textoClean)) {
+        await sendText(
+          sock,
+          from,
+          estado,
+          "👌 Si quieres cambiar algo, dímelo directo (ej. *quita alitas* o *quita boneless*)."
+        );
+        return;
+      }
       const salsaPick = parseEleccionSalsa(textoClean);
       if (salsaPick?.resultado === "error" && salsaPick.msg) {
         await sendText(sock, from, estado, salsaPick.msg);
@@ -3889,6 +3925,8 @@ async function leerSnapshotCritico(from) {
 async function restaurarSnapshotCriticoEnEstado(from, estado) {
   if (estado.pasoPedido) return false;
   if (hayContenidoCarrito(estado)) return false;
+  if (estado.confirmacionPendiente) return false;
+  if (estado.modoHumano) return false;
   const snap = await leerSnapshotCritico(from);
   if (!snap || !snap.expiresAt || snap.expiresAt < Date.now()) return false;
   if (!["G", "H", "I"].includes(snap.pasoPedido)) return false;
