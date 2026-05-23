@@ -921,6 +921,52 @@ function hayComplementosRequiriendoSalsaSinEtiqueta(estado) {
   return !!lineaComplementoSinSalsa(estado);
 }
 
+function conteoLineasSalsaAlitasBoneless(estado) {
+  const conSalsa = [];
+  const sinSalsa = [];
+  for (const L of estado.lineasComplemento || []) {
+    if (!complementoRequiereSalsa(L.nombre)) continue;
+    if (etiquetaSalsaComplemento(L)) conSalsa.push(L);
+    else sinSalsa.push(L);
+  }
+  return { conSalsa, sinSalsa };
+}
+
+function ordinalOrdenSalsa(indice) {
+  const ord = ["primera", "segunda", "tercera", "cuarta", "quinta", "sexta"];
+  return ord[indice] || `${indice + 1}ª`;
+}
+
+function formatearSalsaLineaCliente(L) {
+  let salsa = String(etiquetaSalsaComplemento(L) || "").trim();
+  const extra = Number(L.extraMitadSalsa) || 0;
+  if (extra) salsa += ` (+${extra})`;
+  return salsa;
+}
+
+function textoConfirmacionSalsaConPendientes(estado) {
+  const { conSalsa, sinSalsa } = conteoLineasSalsaAlitasBoneless(estado);
+  const ultima = conSalsa[conSalsa.length - 1];
+  if (!ultima || !sinSalsa.length) return null;
+  const ordHecha = ordinalOrdenSalsa(conSalsa.length - 1);
+  const ordFalta = ordinalOrdenSalsa(conSalsa.length);
+  return (
+    `✅ ${capitalizar(ordHecha)} orden:\n${formatearSalsaLineaCliente(ultima)}\n\n` +
+    `🍗 Falta la salsa de la ${ordFalta} orden 😊\n` +
+    `Puedes escribir solo el nombre, ej. *Buffalo* o *mitad BBQ y Mango*.`
+  );
+}
+
+function textoPidaSalsaSeguimiento(estado) {
+  const { conSalsa, sinSalsa } = conteoLineasSalsaAlitasBoneless(estado);
+  if (!sinSalsa.length) return null;
+  const ordFalta = ordinalOrdenSalsa(conSalsa.length);
+  return (
+    `🍗 Falta la salsa de la ${ordFalta} orden 😊\n` +
+    `Puedes escribir solo el nombre, ej. *Buffalo* o *mitad BBQ y Mango*.`
+  );
+}
+
 function aplicarSalsaALineasSinEtiqueta(estado, salsaLabel, extraMitadSalsa) {
   if (!salsaLabel) return false;
   const L = lineaComplementoSinSalsa(estado);
@@ -947,12 +993,12 @@ async function solicitarSalsaSiFalta(sock, from, estado) {
   const L = lineaComplementoSinSalsa(estado);
   if (!L) return false;
   estado._pendienteSalsaNombre = L.nombre;
-  await sendText(
-    sock,
-    from,
-    estado,
-    `🍗 Para *${capitalizar(L.nombre)}* elige la salsa:\n\n${textoMenuSalsasAlitas()}`
-  );
+  const { conSalsa } = conteoLineasSalsaAlitasBoneless(estado);
+  const texto =
+    conSalsa.length > 0
+      ? textoPidaSalsaSeguimiento(estado)
+      : `🍗 Para *${capitalizar(L.nombre)}* elige la salsa:\n\n${textoMenuSalsasAlitas()}`;
+  await sendText(sock, from, estado, texto);
   return true;
 }
 
@@ -2712,6 +2758,10 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
 
   if (estado.pasoPedido === "D") {
     const salsaPick = parseEleccionSalsa(textoClean);
+    if (salsaPick?.resultado === "error" && salsaPick.msg) {
+      await sendText(sock, from, estado, salsaPick.msg);
+      return;
+    }
     if (salsaPick?.resultado === "ok") {
       if (
         aplicarSalsaALineasSinEtiqueta(
@@ -2722,9 +2772,16 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
       ) {
         estado._pendienteSalsaNombre = null;
         estado._bloqueoSalsaPendiente = false;
-        await sendText(sock, from, estado, `✅ Salsa *${salsaPick.label}* anotada.`);
         if (hayComplementosRequiriendoSalsaSinEtiqueta(estado)) {
-          await solicitarSalsaSiFalta(sock, from, estado);
+          const seguimiento = textoConfirmacionSalsaConPendientes(estado);
+          await sendText(
+            sock,
+            from,
+            estado,
+            seguimiento || `✅ Salsa *${salsaPick.label}* anotada.`
+          );
+        } else {
+          await sendText(sock, from, estado, `✅ Salsa *${salsaPick.label}* anotada.`);
         }
         return;
       }
