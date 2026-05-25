@@ -220,11 +220,17 @@ function capturarContextoEntregaPasivo(estado, textoClean) {
   let ack = null;
 
   const servicio = detectarServicioMencionado(textoClean, estado);
-  if (servicio && !estado.tipoServicio) {
-    if (!estado.tipoServicioMencionado) {
+  if (servicio && !estado.tipoServicio && parecePedidoActivo(estado, textoClean)) {
+    const prev = estado.tipoServicioMencionado;
+    if (!prev || prev !== servicio) {
       estado.tipoServicioMencionado = servicio;
       touch(estado, { tipoServicioMencionado: servicio });
+      if (servicio === "recoger") {
+        estado.direccionPendienteTexto = null;
+        touch(estado, { direccionFragmento: null, coloniaFragmento: null });
+      }
       detalle.servicio = servicio;
+      if (prev) detalle.reemplazo = `${prev}->${servicio}`;
       capturo = true;
     }
   }

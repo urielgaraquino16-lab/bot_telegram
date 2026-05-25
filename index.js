@@ -1258,6 +1258,26 @@ function esNegacionSimple(textoClean) {
   return /^(no|nop|nel|2|listo|ya no)$/.test(x);
 }
 
+/** Paso C: no avanzar con ruido (ok/espera/sí); sí con extras, cierre o "no". */
+function textoPermiteAvanzarPasoC(textoClean) {
+  const x = sinAcentos(normalizarTextoPedido(textoClean));
+  if (!x) return false;
+  if (
+    /(^no$|ninguno|sin\s+extra|nada\s+mas|siguiente|listo|asi\s+esta|sin\s+complemento|nada\s+de\s+extra)/.test(
+      x
+    )
+  ) {
+    return true;
+  }
+  if (esAfirmacionSimple(textoClean) || esNegacionSimple(textoClean)) return false;
+  if (/^(ok|bueno|espera|ahorita|gracias|sale|va|dale|hola|buenas)$/.test(x)) return false;
+  const t = sinAcentos(normalizarTextoPedido(textoClean));
+  for (const ex of restaurante?.extras || []) {
+    if (coincidenciaExtraEnTexto(ex, t)) return true;
+  }
+  return false;
+}
+
 function textoPideVerCarrito(textoClean) {
   return carritoEdiciones.textoPideVerCarrito(textoClean);
 }
@@ -2507,8 +2527,14 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
   }
 
   if (estado.pasoPedido === "C") {
+    const extrasAntes = { ...(estado.extrasActivos || {}) };
     mergeExtrasEnEstado(estado, textoClean);
-    if (textoClean.length > 0) estado.pasoPedido = "D";
+    const extrasNuevos = Object.keys(estado.extrasActivos || {}).some(
+      (k) => estado.extrasActivos[k] && !extrasAntes[k]
+    );
+    if (textoPermiteAvanzarPasoC(textoClean) || extrasNuevos) {
+      estado.pasoPedido = "D";
+    }
     return;
   }
 
@@ -2955,7 +2981,25 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
       return;
     }
     estado.pendienteEnvioConfirmacion = false;
-    await sendText(sock, from, estado, textoConfirmacionPedidoCarly(estado));
+    const resumenG = textoConfirmacionPedidoCarly(estado);
+    const confirmaG =
+      esAfirmacionSimple(textoClean) || esConfirmacionHumana(textoClean);
+    if (confirmaG) {
+      estado.pasoPedido = "H";
+      await sendText(
+        sock,
+        from,
+        estado,
+        `${resumenG}\n\n${pagoCarly.cfg().textoPreguntaMetodo}`
+      );
+    } else {
+      await sendText(
+        sock,
+        from,
+        estado,
+        `${resumenG}\n\n✅ Si está correcto, responde *SÍ* para elegir forma de pago.`
+      );
+    }
     persistirSnapshotCritico(from, estado).catch(() => {});
     return;
   }
@@ -3699,6 +3743,7 @@ function resetEstadoCliente(jid, prevEstado = null) {
   limpiarTimersEstado(estados[jid]);
   estados[jid] = nuevoEstadoCliente();
   estados[jid].notificadoInicio = keepNotif;
+  estados[jid]._snapshotRestoreBloqueado = true;
 }
 
 setInterval(() => {
@@ -3707,6 +3752,7 @@ setInterval(() => {
     if (!st?.ultimaActividadAt) continue;
     if (now - st.ultimaActividadAt > SESSION_INACTIVITY_MS) {
       limpiarTimersEstado(st);
+      borrarSnapshotCritico(jid).catch(() => {});
       delete estados[jid];
     }
   }
@@ -3980,6 +4026,10 @@ async function leerSnapshotCritico(from) {
 }
 
 async function restaurarSnapshotCriticoEnEstado(from, estado) {
+  if (estado._snapshotRestoreBloqueado) {
+    estado._snapshotRestoreBloqueado = false;
+    return false;
+  }
   if (estado.pasoPedido) return false;
   if (hayContenidoCarrito(estado)) return false;
   if (estado.confirmacionPendiente) return false;
@@ -5753,6 +5803,7 @@ async function procesarMensajeUpsert(sock, msg) {
     estados[from]?.ultimaActividadAt &&
     Date.now() - estados[from].ultimaActividadAt > SESSION_INACTIVITY_MS
   ) {
+    await borrarSnapshotCritico(from).catch(() => {});
     resetEstadoCliente(from, estados[from]);
   }
 
