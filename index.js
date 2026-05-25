@@ -1704,10 +1704,32 @@ async function responderAvanceFlujoPedido(sock, from, estado, antes) {
     return true;
   }
   if (p === "E" && pasoCambio && !estado.tipoServicio) {
+    if (estado.tipoServicioMencionado === "recoger") {
+      await sendText(
+        sock,
+        from,
+        estado,
+        "🛵 Tengo anotado *recoger en tienda*.\nResponde *recoger* o *sí* para confirmar 👍"
+      );
+      return true;
+    }
+    if (estado.tipoServicioMencionado === "domicilio" && estado.direccionPendienteTexto) {
+      await sendText(
+        sock,
+        from,
+        estado,
+        `🛵 Tengo anotado *domicilio* a:\n*${estado.direccionPendienteTexto}*\n\nResponde *domicilio* para continuar.`
+      );
+      return true;
+    }
     await sendText(sock, from, estado, "🛵 ¿*Domicilio* o *recoger* en tienda?");
     return true;
   }
   if (p === "F" && estado.tipoServicio === "domicilio") {
+    if (estado.subPasoDireccion === "calle" && estado.dirCalle && antes.sub !== "entre") {
+      await sendText(sock, from, estado, "📍 ¿*Entre qué calles*?");
+      return true;
+    }
     if (estado.subPasoDireccion === "calle" && antes.sub !== "calle") {
       await sendText(sock, from, estado, "📍 ¿*Calle y número* de entrega?");
       return true;
@@ -2532,8 +2554,25 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
   }
 
   if (estado.pasoPedido === "E") {
-    if (/(domicilio|a domicilio|envio|envío|a casa|a mi casa)/.test(textoClean)) {
+    const xE = sinAcentos(normalizarTextoPedido(textoClean));
+    if (
+      !estado.tipoServicio &&
+      estado.tipoServicioMencionado === "recoger" &&
+      (/(recoger|pickup|paso|tienda|local|recojo)/.test(textoClean) ||
+        esAfirmacionSimple(textoClean))
+    ) {
+      estado.tipoServicio = "recoger";
+      estado.tipoServicioMencionado = null;
+      marcarPasoConfirmacionPedido(estado);
+      return;
+    }
+    const confirmaDomicilio =
+      /(domicilio|a domicilio|envio|envío|a casa|a mi casa)/.test(textoClean) ||
+      (estado.tipoServicioMencionado === "domicilio" &&
+        /^(domicilio|si|sii+|ok|va|dale)$/.test(xE));
+    if (confirmaDomicilio) {
       estado.tipoServicio = "domicilio";
+      estado.tipoServicioMencionado = null;
       if (estado.direccionPendienteTexto) {
         estado.dirCalle = estado.direccionPendienteTexto;
         estado.direccionPendienteTexto = null;
@@ -2545,6 +2584,7 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       }
     } else if (/(recoger|pickup|paso|tienda|local|recojo)/.test(textoClean)) {
       estado.tipoServicio = "recoger";
+      estado.tipoServicioMencionado = null;
       marcarPasoConfirmacionPedido(estado);
     }
     return;
@@ -2553,7 +2593,9 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
   if (estado.pasoPedido === "F") {
     const sub = estado.subPasoDireccion || "calle";
     const t = String(texto || "").trim();
-    if (sub === "calle" && t.length >= 4) {
+    const xF = sinAcentos(normalizarTextoPedido(t));
+    const tokenNoCalle = /^(domicilio|recoger|si|sii+|ok|gracias|listo)$/.test(xF);
+    if (sub === "calle" && t.length >= 4 && !tokenNoCalle) {
       estado.dirCalle = t;
       estado.subPasoDireccion = "entre";
     } else if (sub === "entre" && t.length >= 3) {
@@ -2770,15 +2812,28 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     }
   }
 
+  const capEntrega = contextoCarly.capturarContextoEntregaPasivo(estado, textoClean);
+  if (capEntrega?.ack && !estado._ackDireccionTempranaEnviado) {
+    estado._ackDireccionTempranaEnviado = true;
+    await sendText(sock, from, estado, capEntrega.ack);
+  }
+
   const snapPedidoAntes = snapshotPedidoCarly(estado);
   actualizarEstadoDesdeMensaje(estado, texto, textoClean);
 
-  if (estado.pasoPedido === "E" && esAfirmacionSimple(textoClean) && !estado.tipoServicio) {
+  if (
+    estado.pasoPedido === "E" &&
+    esAfirmacionSimple(textoClean) &&
+    !estado.tipoServicio &&
+    estado.tipoServicioMencionado !== "recoger"
+  ) {
     await sendText(
       sock,
       from,
       estado,
-      "🛵 Para continuar responde *domicilio* o *recoger* en tienda (no solo sí) 😊"
+      estado.tipoServicioMencionado === "domicilio" && estado.direccionPendienteTexto
+        ? `🛵 Para continuar responde *domicilio* (tengo anotado: *${estado.direccionPendienteTexto}*) 😊`
+        : "🛵 Para continuar responde *domicilio* o *recoger* en tienda (no solo sí) 😊"
     );
     return;
   }
@@ -3556,6 +3611,8 @@ function nuevoEstadoCliente() {
     referenciaPromoCliente: null,
     tempCantidadPre: null,
     direccionPendienteTexto: null,
+    tipoServicioMencionado: null,
+    _ackDireccionTempranaEnviado: false,
     salsaClarificarUnicas: null,
     salsaClarificarExtraMitad: null,
     lastBotMessageAt: 0,
@@ -5128,7 +5185,11 @@ function initContextoCarly() {
     botLogger,
     hayContextoPizzaClaro: (e) => humanosCarly.hayContextoPizzaClaro(e),
     hayContextoCruzado: (e) => humanosCarly.hayContextoCruzado(e),
-    intentarAclaracionHumana: (e, t) => humanosCarly.intentarAclaracionHumana(e, t)
+    intentarAclaracionHumana: (e, t) => humanosCarly.intentarAclaracionHumana(e, t),
+    detectarDireccionEnTexto,
+    esAfirmacionSimple,
+    esNegacionSimple,
+    esConfirmacionHumana
   });
 }
 

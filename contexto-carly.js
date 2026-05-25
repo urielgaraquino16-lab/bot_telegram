@@ -13,6 +13,9 @@ function init(dependencies) {
   log = deps.botLogger || {};
 }
 
+const MENSAJE_ACK_DIRECCION =
+  "📍 Anoté la dirección, primero terminamos tu pedido 😊";
+
 function crearMemoria() {
   return {
     ultimoTema: null,
@@ -22,6 +25,9 @@ function crearMemoria() {
     ultimoIntent: null,
     ultimaSalsa: null,
     ultimoTamano: null,
+    tipoServicioMencionado: null,
+    direccionFragmento: null,
+    coloniaFragmento: null,
     at: 0
   };
 }
@@ -135,6 +141,111 @@ function actualizarContextoDesdeTexto(estado, textoClean) {
   if (/\b(quiero|dame|necesito|ponme)\b/.test(xNorm(textoClean))) {
     touch(estado, { ultimoIntent: "pedido" });
   }
+}
+
+function parecePedidoActivo(estado, textoClean) {
+  if (estado?.pasoPedido) return true;
+  const x = xNorm(textoClean);
+  return /\b(quiero|dame|pedir|ordenar|mandar|enviar|llevar|me da|necesito|ponme)\b/.test(x);
+}
+
+function esMensajeNoCapturableEntrega(textoClean) {
+  if (!textoClean) return true;
+  const x = xNorm(textoClean);
+  if (deps.esAfirmacionSimple?.(textoClean)) return true;
+  if (deps.esNegacionSimple?.(textoClean)) return true;
+  if (deps.esConfirmacionHumana?.(textoClean)) return true;
+  if (/^(gracias|thank|ok+|listo|perfecto|excelente|bueno|genial|sale)$/.test(x)) {
+    return true;
+  }
+  const tieneMarcadorEntrega =
+    deps.detectarDireccionEnTexto?.(textoClean) ||
+    /\b(colonia|col\s|domicilio|recoger|pickup|envio|envío|a\s+casa)\b/.test(x);
+  if (esMensajeCorto(textoClean) && !tieneMarcadorEntrega) return true;
+  return false;
+}
+
+function detectarServicioMencionado(textoClean, estado) {
+  const x = xNorm(textoClean);
+  if (esConsultaPrecioSuave(textoClean) && !parecePedidoActivo(estado, textoClean)) {
+    return null;
+  }
+  if (/\b(recoger|pickup|paso\s+(por|en)\s+tienda|en\s+tienda|recojo)\b/.test(x)) {
+    return "recoger";
+  }
+  if (/\b(domicilio|a\s+domicilio|envio|envío|a\s+casa|reparto|entrega)\b/.test(x)) {
+    return "domicilio";
+  }
+  return null;
+}
+
+function extraerFragmentoColonia(textoClean) {
+  const raw = String(textoClean || "").trim();
+  const m =
+    raw.match(/\bcolonia\s+([a-z0-9áéíóúñ\s]{4,40})/i) ||
+    raw.match(/\bcol\s+([a-z0-9áéíóúñ\s]{4,40})/i);
+  if (!m) return null;
+  const fragmento = m[0].trim();
+  const tokens = xNorm(fragmento).split(/\s+/).filter((w) => w.length > 2);
+  if (tokens.length < 2) return null;
+  if (fragmento.length < 14) return null;
+  return fragmento;
+}
+
+function extraerTextoParaDireccion(textoClean) {
+  let t = String(textoClean || "").trim();
+  t = t.replace(/^\s*(domicilio|a\s+domicilio|envio|envío|a\s+casa)\s+/i, "").trim();
+  const direccion = deps.detectarDireccionEnTexto?.(t) || deps.detectarDireccionEnTexto?.(textoClean);
+  if (direccion) {
+    const colonia = extraerFragmentoColonia(direccion) || extraerFragmentoColonia(textoClean);
+    return { direccion: direccion.trim(), colonia };
+  }
+  const colonia = extraerFragmentoColonia(textoClean);
+  if (colonia) return { direccion: colonia, colonia };
+  return null;
+}
+
+/**
+ * Captura dirección/servicio adelantados sin mutar pasoPedido ni carrito.
+ */
+function capturarContextoEntregaPasivo(estado, textoClean) {
+  const vacio = { capturo: false, ack: null, detalle: {} };
+  if (!textoClean || !estado) return vacio;
+  if (estado.modoHumano) return vacio;
+  if (["G", "H", "I"].includes(estado.pasoPedido)) return vacio;
+  if (esMensajeNoCapturableEntrega(textoClean)) return vacio;
+
+  const detalle = {};
+  let capturo = false;
+  let ack = null;
+
+  const servicio = detectarServicioMencionado(textoClean, estado);
+  if (servicio && !estado.tipoServicio) {
+    if (!estado.tipoServicioMencionado) {
+      estado.tipoServicioMencionado = servicio;
+      touch(estado, { tipoServicioMencionado: servicio });
+      detalle.servicio = servicio;
+      capturo = true;
+    }
+  }
+
+  const dir = extraerTextoParaDireccion(textoClean);
+  if (dir?.direccion && !estado.dirCalle && !estado.direccionCompleta) {
+    const prev = estado.direccionPendienteTexto;
+    if (!prev || dir.direccion.length > String(prev).length) {
+      estado.direccionPendienteTexto = dir.direccion;
+      touch(estado, {
+        direccionFragmento: dir.direccion,
+        coloniaFragmento: dir.colonia || null
+      });
+      detalle.direccion = dir.direccion.slice(0, 80);
+      capturo = true;
+      ack = MENSAJE_ACK_DIRECCION;
+    }
+  }
+
+  if (capturo && log.contexto) log.contexto("captura_entrega", detalle);
+  return { capturo, ack, detalle };
 }
 
 function expandirTextoConContexto(estado, textoClean) {
@@ -332,7 +443,9 @@ module.exports = {
   crearMemoria,
   memoriaVigente,
   actualizarContextoDesdeTexto,
+  capturarContextoEntregaPasivo,
   expandirTextoConContexto,
   intentarRespuestaConContexto,
-  respuestaFallbackInteligente
+  respuestaFallbackInteligente,
+  MENSAJE_ACK_DIRECCION
 };
