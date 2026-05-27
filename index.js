@@ -91,6 +91,70 @@ const GROQ_RATE_LIMIT_SENTINEL = "__RATE_LIMIT__";
 const TELEGRAM_PANEL_ENABLED = process.env.TELEGRAM_PANEL !== "0";
 const TELEGRAM_ADMIN_IDS = process.env.TELEGRAM_ADMIN_IDS || "";
 
+// =========================
+// Debug tracing conversacional (sin alterar flujo)
+// Activa con: CARLY_DEBUG_FLOW=1
+// =========================
+function debugFlowEnabled() {
+  return process.env.CARLY_DEBUG_FLOW === "1";
+}
+
+function previewTxt(s, max = 40) {
+  const t = String(s || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
+function fromTail(from) {
+  const d = String(from || "").split("@")[0].replace(/\D/g, "");
+  if (!d) return null;
+  return d.length <= 6 ? d : d.slice(-6);
+}
+
+function debugFlagsCompact(estado) {
+  return {
+    pasoPedido: estado?.pasoPedido || null,
+    modoHumano: !!estado?.modoHumano,
+    pendienteEnvioConfirmacion: !!estado?.pendienteEnvioConfirmacion,
+    bloqueoSalsa: !!estado?._bloqueoSalsaPendiente,
+    confirmacionPendiente: !!estado?.confirmacionPendiente,
+    tipoServicioMencionado: estado?.tipoServicioMencionado || null
+  };
+}
+
+function debugEmit(categoria, evento, payload) {
+  try {
+    const fn = botLogger?.[categoria];
+    if (typeof fn === "function") {
+      Promise.resolve(fn(evento, payload)).catch(() => {});
+    }
+  } catch {
+    /* no bloquear al cliente */
+  }
+}
+
+function debugFlow(tag, estado, payload = {}) {
+  if (!debugFlowEnabled()) return;
+  const categoria =
+    tag.startsWith("CTX") ? "contexto"
+      : tag.startsWith("QUEUE") || tag.startsWith("BURST") ? "multiples_mensajes"
+        : tag.startsWith("FALLBACK") ? "fallback"
+          : "estado";
+
+  const clean = {};
+  for (const [k, v] of Object.entries(payload || {})) {
+    if (v == null) continue;
+    if (v === false) continue;
+    clean[k] = v;
+  }
+  const out = {
+    tag,
+    ...debugFlagsCompact(estado),
+    ...clean
+  };
+  debugEmit(categoria, tag, out);
+}
+
 function parseTelegramAdminIds(envVal) {
   return new Set(
     String(envVal || "")
@@ -2532,7 +2596,14 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
     const extrasNuevos = Object.keys(estado.extrasActivos || {}).some(
       (k) => estado.extrasActivos[k] && !extrasAntes[k]
     );
-    if (textoPermiteAvanzarPasoC(textoClean) || extrasNuevos) {
+    const avanzarC = textoPermiteAvanzarPasoC(textoClean) || extrasNuevos;
+    if (!avanzarC) {
+      debugFlow("STEP_BLOCK", estado, {
+        razon: "paso_c_texto_ambiguo",
+        texto: previewTxt(textoClean, 28)
+      });
+    }
+    if (avanzarC) {
       estado.pasoPedido = "D";
     }
     return;
@@ -2587,6 +2658,7 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       (/(recoger|pickup|paso|tienda|local|recojo)/.test(textoClean) ||
         esAfirmacionSimple(textoClean))
     ) {
+      debugFlow("STEP", estado, { razon: "consume_tipoServicioMencionado_recoger" });
       estado.tipoServicio = "recoger";
       estado.tipoServicioMencionado = null;
       marcarPasoConfirmacionPedido(estado);
@@ -2597,6 +2669,7 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
       (estado.tipoServicioMencionado === "domicilio" &&
         /^(domicilio|si|sii+|ok|va|dale)$/.test(xE));
     if (confirmaDomicilio) {
+      debugFlow("STEP", estado, { razon: "confirma_domicilio" });
       estado.tipoServicio = "domicilio";
       estado.tipoServicioMencionado = null;
       if (estado.direccionPendienteTexto) {
@@ -2609,6 +2682,7 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
         estado.subPasoDireccion = "calle";
       }
     } else if (/(recoger|pickup|paso|tienda|local|recojo)/.test(textoClean)) {
+      debugFlow("STEP", estado, { razon: "recoger_explicito" });
       estado.tipoServicio = "recoger";
       estado.tipoServicioMencionado = null;
       marcarPasoConfirmacionPedido(estado);
@@ -2621,6 +2695,9 @@ function actualizarEstadoDesdeMensaje(estado, texto, textoClean) {
     const t = String(texto || "").trim();
     const xF = sinAcentos(normalizarTextoPedido(t));
     const tokenNoCalle = /^(domicilio|recoger|si|sii+|ok|gracias|listo)$/.test(xF);
+    if (sub === "calle" && t.length >= 2 && tokenNoCalle) {
+      debugFlow("STEP_BLOCK", estado, { razon: "token_no_calle", texto: previewTxt(t, 18) });
+    }
     if (sub === "calle" && t.length >= 4 && !tokenNoCalle) {
       estado.dirCalle = t;
       estado.subPasoDireccion = "entre";
@@ -2736,8 +2813,10 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
       hayContenidoCarrito(estado);
     if (!hayPedidoActivo) {
       await sendText(sock, from, estado, "😊 No tienes un pedido activo.");
+      debugFlow("CANCEL", estado, { fromTail: fromTail(from), razon: "sin_pedido_activo" });
       return;
     }
+    debugFlow("CANCEL", estado, { fromTail: fromTail(from), paso: estado.pasoPedido || null });
     await registrarEventoMetricas("pedido_cancelado", { from, paso: estado.pasoPedido || "?" });
     resetEstadoCliente(from, estado);
     const estadoVivo = estados[from];
@@ -2771,13 +2850,16 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
       estado.modoHumano = false;
       estado.tiempoEscalado = 0;
       await sendText(sock, from, estado, MENSAJE_REACTIVACION_BOT);
+      debugFlow("GUARD", estado, { fromTail: fromTail(from), razon: "modoHumano_ttl_reactiva" });
     } else {
+      debugFlow("GUARD", estado, { fromTail: fromTail(from), razon: "modoHumano_activo" });
       return;
     }
   }
 
   if (!estaAbiertoEfectivo()) {
     await sendText(sock, from, estado, MENSAJE_FUERA_HORARIO);
+    debugFlow("GUARD", estado, { fromTail: fromTail(from), razon: "fuera_horario" });
     return;
   }
 
@@ -2807,6 +2889,7 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
         estado,
         "📍 Recibí tu ubicación. Cuando hagas pedido a domicilio, la usamos 👍"
       );
+      debugFlow("GUARD", estado, { fromTail: fromTail(from), razon: "ubicacion_ignorada_sin_domicilio" });
       return;
     }
   }
@@ -2985,6 +3068,7 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
     const confirmaG =
       esAfirmacionSimple(textoClean) || esConfirmacionHumana(textoClean);
     if (confirmaG) {
+      debugFlow("CONFIRM", estado, { fromTail: fromTail(from), paso: "G", evento: "unificado_primer_si" });
       estado.pasoPedido = "H";
       await sendText(
         sock,
@@ -2993,6 +3077,7 @@ async function procesarConversacionCarly(sock, msg, from, quien, estado, texto, 
         `${resumenG}\n\n${pagoCarly.cfg().textoPreguntaMetodo}`
       );
     } else {
+      debugFlow("CONFIRM", estado, { fromTail: fromTail(from), paso: "G", evento: "resumen_solo_pide_si" });
       await sendText(
         sock,
         from,
@@ -4027,16 +4112,38 @@ async function leerSnapshotCritico(from) {
 
 async function restaurarSnapshotCriticoEnEstado(from, estado) {
   if (estado._snapshotRestoreBloqueado) {
+    debugFlow("SNAPSHOT_RESTORE_BLOCK", estado, {
+      fromTail: fromTail(from),
+      razon: "snapshotRestoreBloqueado"
+    });
     estado._snapshotRestoreBloqueado = false;
     return false;
   }
-  if (estado.pasoPedido) return false;
-  if (hayContenidoCarrito(estado)) return false;
-  if (estado.confirmacionPendiente) return false;
-  if (estado.modoHumano) return false;
+  if (estado.pasoPedido) {
+    debugFlow("SNAPSHOT_RESTORE_BLOCK", estado, { fromTail: fromTail(from), razon: "pasoPedido_activo" });
+    return false;
+  }
+  if (hayContenidoCarrito(estado)) {
+    debugFlow("SNAPSHOT_RESTORE_BLOCK", estado, { fromTail: fromTail(from), razon: "carrito_activo" });
+    return false;
+  }
+  if (estado.confirmacionPendiente) {
+    debugFlow("SNAPSHOT_RESTORE_BLOCK", estado, { fromTail: fromTail(from), razon: "confirmacionPendiente" });
+    return false;
+  }
+  if (estado.modoHumano) {
+    debugFlow("SNAPSHOT_RESTORE_BLOCK", estado, { fromTail: fromTail(from), razon: "modoHumano" });
+    return false;
+  }
   const snap = await leerSnapshotCritico(from);
-  if (!snap || !snap.expiresAt || snap.expiresAt < Date.now()) return false;
-  if (!["G", "H", "I"].includes(snap.pasoPedido)) return false;
+  if (!snap || !snap.expiresAt || snap.expiresAt < Date.now()) {
+    debugFlow("SNAPSHOT_RESTORE_BLOCK", estado, { fromTail: fromTail(from), razon: "snap_inexistente_o_expirado" });
+    return false;
+  }
+  if (!["G", "H", "I"].includes(snap.pasoPedido)) {
+    debugFlow("SNAPSHOT_RESTORE_BLOCK", estado, { fromTail: fromTail(from), razon: "snap_paso_invalido", paso: snap.pasoPedido });
+    return false;
+  }
   aplicarSnapshotPedidoAEstado(estado, snap);
   estado.pasoPedido = snap.pasoPedido;
   estado.formaPago = snap.metodoPago || null;
@@ -4047,7 +4154,7 @@ async function restaurarSnapshotCriticoEnEstado(from, estado) {
   estado.dirReferencia = snap.dirReferencia ?? estado.dirReferencia;
   estado.direccionCompleta = snap.direccionCompleta ?? estado.direccionCompleta;
   if (snap.pasoPedido === "G") estado.pendienteEnvioConfirmacion = true;
-  console.log("[Carly] snapshot crítico restaurado", from, snap.pasoPedido);
+  debugFlow("SNAPSHOT_RESTORE", estado, { fromTail: fromTail(from), paso: snap.pasoPedido });
   return true;
 }
 
@@ -5798,11 +5905,17 @@ async function procesarMensajeUpsert(sock, msg) {
 
   const msgId = mensajeIdDeKey(msg);
   const quien = etiquetaCliente(msg);
+  debugFlow("MSG_IN", estados[from] || null, {
+    fromTail: fromTail(from),
+    msgId: msgId || null,
+    quien: previewTxt(quien, 28)
+  });
 
   if (
     estados[from]?.ultimaActividadAt &&
     Date.now() - estados[from].ultimaActividadAt > SESSION_INACTIVITY_MS
   ) {
+    debugFlow("SNAPSHOT_DELETE_IDLE", estados[from] || null, { fromTail: fromTail(from) });
     await borrarSnapshotCritico(from).catch(() => {});
     resetEstadoCliente(from, estados[from]);
   }
@@ -5818,6 +5931,7 @@ async function procesarMensajeUpsert(sock, msg) {
 
   if (mensajeYaProcesado(estado, msgId)) {
     console.log("[Carly] mensaje duplicado ignorado", msgId || "?");
+    debugFlow("MSG_DUP", estado, { fromTail: fromTail(from), msgId: msgId || null });
     return;
   }
 
@@ -5832,6 +5946,11 @@ async function procesarMensajeUpsert(sock, msg) {
   const textoClean = sinAcentos(textoLower.trim());
 
   console.log("📩", from, textoClean, msgId ? `id=${msgId}` : "");
+  debugFlow("MSG_TEXT", estado, {
+    fromTail: fromTail(from),
+    msgId: msgId || null,
+    texto: previewTxt(textoClean, 40)
+  });
   estado.lastUserMessageAt = Date.now();
 
   if (await manejarComandoAdmin(sock, from, texto)) {
@@ -5869,6 +5988,7 @@ async function procesarMensajeUpsert(sock, msg) {
     const idActivo = mensajeIdDeKey(msgActivo);
     if (mensajeYaProcesado(st, idActivo)) {
       console.log("[Carly] mensaje duplicado ignorado (cola)", idActivo || "?");
+      debugFlow("QUEUE_DUP", st, { fromTail: fromTail(from), msgId: idActivo || null });
       drenarColaPendiente();
       return;
     }
@@ -5884,12 +6004,23 @@ async function procesarMensajeUpsert(sock, msg) {
             esNuevo: !!esNuevo,
             at: Date.now()
           });
+          debugFlow("QUEUE_ENQUEUE", st, {
+            fromTail: fromTail(from),
+            msgId: idActivo || null,
+            n: st._pendingMessages.length
+          });
         } else {
           console.warn("[Carly] cola_descartada_limite", {
             cliente: from,
             cantidad: st._pendingMessages.length,
             max: MAX_PENDING_MESSAGES,
             ts: Date.now()
+          });
+          debugFlow("QUEUE_DROP", st, {
+            fromTail: fromTail(from),
+            msgId: idActivo || null,
+            n: st._pendingMessages.length,
+            max: MAX_PENDING_MESSAGES
           });
           registrarEventoMetricas("cola_descartada_limite", {
             from,
@@ -5921,6 +6052,7 @@ async function procesarMensajeUpsert(sock, msg) {
   };
 
   if (humanosCarly.debeAgruparBurst(st, textoClean)) {
+    debugFlow("BURST_ENQUEUE", st, { fromTail: fromTail(from), msgId: msgId || null });
     humanosCarly.encolarBurst(st, { texto, textoClean }, ({ texto: t, textoClean: tc }) => {
       ejecutarProcesamiento(msg, t, tc, false).catch((err) =>
         console.error("❌ burst procesar:", err?.message || err)
